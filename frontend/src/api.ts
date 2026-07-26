@@ -62,7 +62,15 @@ export const api = {
     axisKind?: AxisKind;
     subsetId?: string;
     limit?: number;
-  }, options?: { signal?: AbortSignal }): Promise<{ items: SpectrumItem[]; count: number; limit: number; axis_summary: AxisSummary[] }> {
+  }, options?: { signal?: AbortSignal }): Promise<{
+    items: SpectrumItem[];
+    count: number;
+    limit: number;
+    axis_summary: AxisSummary[];
+    point_budget?: number;
+    returned_point_count?: number;
+    truncated_by_point_budget?: boolean;
+  }> {
     const query = new URLSearchParams();
     if (params.classKey) query.set("class_key", params.classKey);
     if (params.axisKind) query.set("axis_kind", params.axisKind);

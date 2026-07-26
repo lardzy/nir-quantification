@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gzip
+import hashlib
 from collections.abc import Iterable, Sequence
 from datetime import datetime, timezone
 from typing import Any
@@ -15,6 +17,7 @@ SPECTRUM_DETAIL_COLUMNS = (
     Spectrum.id,
     Spectrum.file_name,
     Spectrum.source_path_last_seen,
+    Spectrum.content_sha256,
     Spectrum.metadata_json,
     Spectrum.axis_kind,
     Spectrum.axis_unit,
@@ -46,6 +49,17 @@ def build_classification(labels: Iterable[ParsedComponent]) -> tuple[str, str, i
 def upsert_spectrum_from_parsed(session: Session, parsed: ParsedSpectrum) -> str:
     existing = session.scalar(select(Spectrum).where(Spectrum.file_name == parsed.file_name))
     if existing is not None:
+        existing_raw = gzip.decompress(existing.raw_csv_gzip)
+        existing_digest = existing.content_sha256 or hashlib.sha256(existing_raw).hexdigest()
+        if existing_digest != parsed.content_sha256:
+            existing_normalized = _normalized_csv_digest(existing_raw)
+            parsed_raw = gzip.decompress(parsed.raw_csv_gzip)
+            if existing_normalized != _normalized_csv_digest(parsed_raw):
+                raise ValueError(
+                    f"file name conflict: {parsed.file_name} already exists with different content"
+                )
+            existing.raw_csv_gzip = parsed.raw_csv_gzip
+        existing.content_sha256 = parsed.content_sha256
         existing.source_path_last_seen = parsed.source_path
         existing.updated_at = utcnow()
         return "skipped"
@@ -55,6 +69,7 @@ def upsert_spectrum_from_parsed(session: Session, parsed: ParsedSpectrum) -> str
         file_name=parsed.file_name,
         source_path_last_seen=parsed.source_path,
         raw_csv_gzip=parsed.raw_csv_gzip,
+        content_sha256=parsed.content_sha256,
         metadata_json=encode_json(parsed.metadata),
         axis_kind=parsed.axis_kind,
         axis_unit=parsed.axis_unit,
@@ -76,6 +91,7 @@ def spectrum_to_dict(spectrum: Spectrum) -> dict[str, Any]:
         "id": spectrum.id,
         "file_name": spectrum.file_name,
         "source_path_last_seen": spectrum.source_path_last_seen,
+        "content_sha256": spectrum.content_sha256,
         "metadata": decode_json(spectrum.metadata_json, {}),
         "axis_kind": spectrum.axis_kind,
         "axis_unit": spectrum.axis_unit,
@@ -98,6 +114,7 @@ def spectrum_row_to_dict(row: Any) -> dict[str, Any]:
         "id": row.id,
         "file_name": row.file_name,
         "source_path_last_seen": row.source_path_last_seen,
+        "content_sha256": row.content_sha256,
         "metadata": decode_json(row.metadata_json, {}),
         "axis_kind": row.axis_kind,
         "axis_unit": row.axis_unit,
@@ -281,6 +298,37 @@ def adjust_class_stats_for_exclusion(session: Session, spectrum: Spectrum, exclu
     }
 
 
+def transition_spectrum_exclusion(
+    session: Session,
+    spectrum_id: int,
+    *,
+    excluded: bool,
+) -> tuple[Spectrum | None, bool]:
+    """Apply one exclusion state transition with a database-level compare-and-set."""
+    changed_at = utcnow()
+    result = session.execute(
+        update(Spectrum)
+        .where(
+            Spectrum.id == spectrum_id,
+            Spectrum.is_excluded.is_(not excluded),
+        )
+        .values(
+            is_excluded=excluded,
+            excluded_at=changed_at if excluded else None,
+            updated_at=changed_at,
+        )
+    )
+    changed = bool(getattr(result, "rowcount", 0))
+
+    # A caller may already have loaded a stale identity into this session. Always
+    # expire it so an idempotent request returns the committed database state.
+    session.expire_all()
+    spectrum = session.get(Spectrum, spectrum_id)
+    if spectrum is not None and changed:
+        adjust_class_stats_for_exclusion(session, spectrum, excluded=excluded)
+    return spectrum, changed
+
+
 def spectra_summary(
     session: Session,
     class_key: str | None,
@@ -366,12 +414,41 @@ def fetch_spectra(
     axis_kind: str | None = None,
     subset_spectrum_ids: list[int] | None = None,
     limit: int = 500,
-) -> list[dict[str, Any]]:
-    stmt = select(*SPECTRUM_DETAIL_COLUMNS)
-    stmt = _apply_spectrum_filters(stmt, class_key, excluded, component_count, axis_kind, subset_spectrum_ids)
-    stmt = stmt.order_by(Spectrum.file_name.asc()).limit(limit)
-    rows = session.execute(stmt).all()
-    return [spectrum_row_to_dict(row) for row in rows]
+    max_total_points: int | None = None,
+) -> tuple[list[dict[str, Any]], bool, int]:
+    items: list[dict[str, Any]] = []
+    total_points = 0
+    after_file_name: str | None = None
+    truncated_by_point_budget = False
+
+    while len(items) < limit:
+        stmt = select(*SPECTRUM_DETAIL_COLUMNS)
+        stmt = _apply_spectrum_filters(stmt, class_key, excluded, component_count, axis_kind, subset_spectrum_ids)
+        if after_file_name is not None:
+            stmt = stmt.where(Spectrum.file_name > after_file_name)
+        batch_limit = min(100, limit - len(items))
+        rows = session.execute(
+            stmt.order_by(Spectrum.file_name.asc()).limit(batch_limit)
+        ).all()
+        if not rows:
+            break
+
+        for row in rows:
+            row_points = int(row.point_count or 0)
+            if (
+                max_total_points is not None
+                and items
+                and total_points + row_points > max_total_points
+            ):
+                truncated_by_point_budget = True
+                break
+            items.append(spectrum_row_to_dict(row))
+            total_points += row_points
+            after_file_name = row.file_name
+        if truncated_by_point_budget or len(rows) < batch_limit:
+            break
+
+    return items, truncated_by_point_budget, total_points
 
 
 def fetch_recent_excluded(session: Session, limit: int = 50) -> list[dict[str, Any]]:
@@ -476,3 +553,9 @@ def _cached_total_count(
     if excluded == "excluded":
         return int(row.excluded_count or 0)
     return int(row.total_count or 0)
+
+
+def _normalized_csv_digest(raw_bytes: bytes) -> str:
+    text = raw_bytes.decode("utf-8-sig")
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()

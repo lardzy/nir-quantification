@@ -37,12 +37,15 @@ import {
   ReloadOutlined,
   UndoOutlined
 } from "@ant-design/icons";
-import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { lazy, startTransition, Suspense, useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, subscribeJob } from "./api";
 import { formatSpectrumLabels, getAxisDisplayLabel } from "./chartInteraction";
-import { SpectrumChart } from "./SpectrumChart";
 import type { AxisKind, AxisSummary, FsEntry, JobItem, LoadingMeta, SpectrumClass, SpectrumItem, SubsetSummary } from "./types";
 import "./styles.css";
+
+const SpectrumChart = lazy(() =>
+  import("./SpectrumChart").then((module) => ({ default: module.SpectrumChart }))
+);
 
 const { Content, Sider } = Layout;
 const { Paragraph, Text, Title } = Typography;
@@ -70,6 +73,8 @@ type PreviewState = "idle" | "loading-summary" | "loading-detail" | "ready" | "e
 type SpectraResponse = Awaited<ReturnType<typeof api.getSpectra>>;
 
 const PREVIEW_LOADING_DELAY_MS = 200;
+const SUMMARY_CACHE_MAX_ENTRIES = 128;
+const DETAIL_CACHE_MAX_ENTRIES = 24;
 
 const EXPORT_SCOPE_LABELS: Record<ExportScope, string> = {
   active: "未剔除",
@@ -106,6 +111,27 @@ function getDetailCacheKey(
   axisKind: AxisKind
 ) {
   return `${getSummaryCacheKey(classKey, excluded, subsetId)}::${axisKind}`;
+}
+
+function getLruValue<K, V>(cache: Map<K, V>, key: K): V | undefined {
+  const value = cache.get(key);
+  if (value !== undefined) {
+    cache.delete(key);
+    cache.set(key, value);
+  }
+  return value;
+}
+
+function setLruValue<K, V>(cache: Map<K, V>, key: K, value: V, maxEntries: number) {
+  cache.delete(key);
+  cache.set(key, value);
+  while (cache.size > maxEntries) {
+    const oldestKey = cache.keys().next().value as K | undefined;
+    if (oldestKey === undefined) {
+      break;
+    }
+    cache.delete(oldestKey);
+  }
 }
 
 function useViewportWidth() {
@@ -461,12 +487,17 @@ function Workspace() {
     if (!selectedClass) {
       return;
     }
-    summaryCacheRef.current.set(getSummaryCacheKey(selectedClass.class_key, excludedFilter, activeSubsetId), {
-      status: "ready",
-      progress_message: null,
-      total_count: nextTotal,
-      axis_summary: nextAxisSummary
-    });
+    setLruValue(
+      summaryCacheRef.current,
+      getSummaryCacheKey(selectedClass.class_key, excludedFilter, activeSubsetId),
+      {
+        status: "ready",
+        progress_message: null,
+        total_count: nextTotal,
+        axis_summary: nextAxisSummary
+      },
+      SUMMARY_CACHE_MAX_ENTRIES
+    );
   }
 
   function patchCurrentDetailCache(nextItems: SpectrumItem[], nextTotal: number, nextAxisSummary: AxisSummary[]) {
@@ -478,12 +509,19 @@ function Workspace() {
       detailCacheRef.current.delete(detailKey);
       return;
     }
-    detailCacheRef.current.set(detailKey, {
-      items: nextItems,
-      count: nextTotal,
-      limit: 2000,
-      axis_summary: nextAxisSummary
-    });
+    const currentCache = detailCacheRef.current.get(detailKey);
+    setLruValue(
+      detailCacheRef.current,
+      detailKey,
+      {
+        ...currentCache,
+        items: nextItems,
+        count: nextTotal,
+        limit: 2000,
+        axis_summary: nextAxisSummary
+      },
+      DETAIL_CACHE_MAX_ENTRIES
+    );
   }
 
   function applyPreviewTargetReset(resetAxisSelection: boolean) {
@@ -581,7 +619,7 @@ function Workspace() {
   ) {
     cancelPreviewRequests();
     const summaryKey = getSummaryCacheKey(targetClass.class_key, targetFilter, subsetId);
-    const cached = !options?.bypassCache ? summaryCacheRef.current.get(summaryKey) : undefined;
+    const cached = !options?.bypassCache ? getLruValue(summaryCacheRef.current, summaryKey) : undefined;
     if (cached) {
       const { nextAxisSummary } = applySummaryPayload(cached, preferredAxisKind);
       setPreviewLimitMessage(null);
@@ -609,7 +647,7 @@ function Workspace() {
       if (previewToken !== previewTokenRef.current) {
         return;
       }
-      summaryCacheRef.current.set(summaryKey, data);
+      setLruValue(summaryCacheRef.current, summaryKey, data, SUMMARY_CACHE_MAX_ENTRIES);
       const { nextAxisSummary } = applySummaryPayload(data, preferredAxisKind);
 
       if (nextAxisSummary.length === 0) {
@@ -638,9 +676,14 @@ function Workspace() {
   ) {
     detailAbortRef.current?.abort();
     const detailKey = getDetailCacheKey(targetClass.class_key, targetFilter, subsetId, axisKind);
-    const cached = !options?.bypassCache ? detailCacheRef.current.get(detailKey) : undefined;
+    const cached = !options?.bypassCache ? getLruValue(detailCacheRef.current, detailKey) : undefined;
     if (cached) {
       startTransition(() => setSpectra(cached.items));
+      setPreviewLimitMessage(
+        cached.truncated_by_point_budget
+          ? `为控制浏览器内存，本次按点数预算加载了 ${cached.items.length} 条（${cached.returned_point_count ?? 0} 个数据点）；请生成更小的子集以查看其余光谱。`
+          : null
+      );
       finishPreviewLoading(cached.items.length > 0 ? "ready" : "empty");
       return;
     }
@@ -660,8 +703,13 @@ function Workspace() {
         },
         { signal: controller.signal }
       );
-      detailCacheRef.current.set(detailKey, data);
+      setLruValue(detailCacheRef.current, detailKey, data, DETAIL_CACHE_MAX_ENTRIES);
       startTransition(() => setSpectra(data.items));
+      setPreviewLimitMessage(
+        data.truncated_by_point_budget
+          ? `为控制浏览器内存，本次按点数预算加载了 ${data.items.length} 条（${data.returned_point_count ?? 0} 个数据点）；请生成更小的子集以查看其余光谱。`
+          : null
+      );
       finishPreviewLoading(data.items.length > 0 ? "ready" : "empty");
     } catch (error) {
       if (!isAbortError(error)) {
@@ -783,7 +831,11 @@ function Workspace() {
     } else if (delta > 0) {
       nextMap.set(key, { axis_kind: spectrum.axis_kind as AxisKind, axis_unit: spectrum.axis_unit, count: delta });
     }
-    return sortAxisSummary(Array.from(nextMap.values()).filter((item) => item.count > 0));
+    return sortAxisSummary(
+      Array.from(nextMap.values()).filter(
+        (item) => item.count > 0 || item.axis_kind === selectedAxisKind
+      )
+    );
   }
 
   function sortSpectraByFileName(items: SpectrumItem[]) {
@@ -1468,6 +1520,14 @@ function Workspace() {
                       description="当前曲线超过 800 条，已关闭悬停预览和悬停高亮，以保证缩放、平移和点击操作流畅。"
                     />
                   )}
+                  {selectedClass && previewState === "ready" && previewLimitMessage && (
+                    <Alert
+                      type="warning"
+                      showIcon
+                      message="预览已按点数预算截断"
+                      description={previewLimitMessage}
+                    />
+                  )}
                   {selectedClass && previewState === "over-limit" && previewLimitMessage && (
                     <Alert
                       type="warning"
@@ -1488,15 +1548,17 @@ function Workspace() {
                     />
                   )}
                   {selectedClass && previewState === "ready" && canRender && (
-                    <SpectrumChart
-                      key={`${selectedClass.class_key}:${excludedFilter}:${selectedAxisKind ?? "all"}:${activeSubsetId ?? "all"}`}
-                      spectra={previewSpectra}
-                      resetSignal={chartResetToken}
-                      lockedSpectrumId={lockedSpectrum?.id ?? null}
-                      interactionMode={chartDensityMode}
-                      onLockSpectrum={setLockedSpectrum}
-                      onQuickExclude={(spectrum) => void handleExclude(spectrum)}
-                    />
+                    <Suspense fallback={<Spin size="large" />}>
+                      <SpectrumChart
+                        key={`${selectedClass.class_key}:${excludedFilter}:${selectedAxisKind ?? "all"}:${activeSubsetId ?? "all"}`}
+                        spectra={previewSpectra}
+                        resetSignal={chartResetToken}
+                        lockedSpectrumId={lockedSpectrum?.id ?? null}
+                        interactionMode={chartDensityMode}
+                        onLockSpectrum={setLockedSpectrum}
+                        onQuickExclude={(spectrum) => void handleExclude(spectrum)}
+                      />
+                    </Suspense>
                   )}
                 </Card>
 

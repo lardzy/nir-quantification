@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import random
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -15,6 +17,8 @@ from torch.utils.data import DataLoader, Dataset
 from .constants import FIBER_CLASSES, FIXED_GRID_SIZE, FIXED_WAVELENGTHS
 from .metrics import evaluate_split, search_best_threshold
 from .modeling import InceptionQuantModel
+
+MODEL_BUNDLE_SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -60,7 +64,7 @@ def train_pipeline(
 
     records = _load_jsonl(Path(manifest_path))
     split_definition = _load_json(Path(splits_path))
-    split_assignments = split_definition["assignments"]
+    split_assignments = _validate_split_definition(records, split_definition)
 
     train_records = [record for record in records if split_assignments[record["fabric_id"]] == "train"]
     val_records = [record for record in records if split_assignments[record["fabric_id"]] == "val"]
@@ -74,6 +78,7 @@ def train_pipeline(
     test_dataset = ManifestDataset(test_records, mean, std)
 
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
+    train_eval_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=False)
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False)
 
@@ -99,7 +104,7 @@ def train_pipeline(
         )
         if val_epoch["losses"]["total_loss"] < best_val_loss:
             best_val_loss = val_epoch["losses"]["total_loss"]
-            best_state = {name: tensor.detach().cpu() for name, tensor in model.state_dict().items()}
+            best_state = deepcopy(model.state_dict())
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
@@ -115,9 +120,10 @@ def train_pipeline(
     threshold = search_best_threshold(
         truth_presence=val_eval["truth_presence"],
         predicted_presence_probabilities=val_eval["predicted_presence_probabilities"],
+        predicted_composition_probabilities=val_eval["predicted_composition_probabilities"],
     )
 
-    train_eval = _run_epoch(model, train_loader, presence_loss, composition_loss, optimizer=None)
+    train_eval = _run_epoch(model, train_eval_loader, presence_loss, composition_loss, optimizer=None)
     test_eval = _run_epoch(model, test_loader, presence_loss, composition_loss, optimizer=None)
 
     train_metrics, train_rows, _ = evaluate_split(
@@ -143,12 +149,21 @@ def train_pipeline(
     )
 
     bundle = {
+        "schema_version": MODEL_BUNDLE_SCHEMA_VERSION,
+        "model_name": "InceptionQuantModel",
         "model_state_dict": best_state,
         "threshold": threshold,
         "feature_mean": mean.tolist(),
         "feature_std": std.tolist(),
         "fiber_classes": FIBER_CLASSES,
         "fixed_wavelengths": FIXED_WAVELENGTHS,
+        "feature_grid_size": FIXED_GRID_SIZE,
+        "preprocessing": {
+            "name": "per_wavelength_standardization",
+            "version": 1,
+        },
+        "manifest_sha256": _sha256_file(Path(manifest_path)),
+        "splits_sha256": _sha256_file(Path(splits_path)),
         "config": asdict(config),
     }
     torch.save(bundle, output_path / "model_bundle.pt")
@@ -184,7 +199,9 @@ def _seed_everything(seed: int) -> None:
 def _compute_feature_stats(records: list[dict[str, Any]]) -> tuple[torch.Tensor, torch.Tensor]:
     stacked = torch.tensor([record["fixed_absorbance"] for record in records], dtype=torch.float32)
     mean = stacked.mean(dim=0)
-    std = stacked.std(dim=0)
+    # Population standard deviation remains defined for a one-sample training
+    # split; the default unbiased estimator would yield NaN in that case.
+    std = stacked.std(dim=0, correction=0)
     std = torch.where(std < 1e-6, torch.full_like(std, 1e-6), std)
     return mean, std
 
@@ -212,28 +229,30 @@ def _run_epoch(
     total_presence = 0.0
     total_composition = 0.0
     total_loss = 0.0
-    total_batches = 0
+    total_samples = 0
 
     truth_presence: list[list[int]] = []
     predicted_presence_probabilities: list[list[float]] = []
     predicted_composition_probabilities: list[list[float]] = []
 
     for features, presence_targets, ratio_targets in loader:
+        batch_size = int(features.shape[0])
         if training:
             optimizer.zero_grad()
-        presence_logits, composition_logits = model(features)
-        batch_presence_loss = presence_loss(presence_logits, presence_targets)
-        batch_composition_loss = composition_loss(F.log_softmax(composition_logits, dim=-1), ratio_targets)
-        batch_total_loss = 0.4 * batch_presence_loss + 0.6 * batch_composition_loss
+        with torch.set_grad_enabled(training):
+            presence_logits, composition_logits = model(features)
+            batch_presence_loss = presence_loss(presence_logits, presence_targets)
+            batch_composition_loss = composition_loss(F.log_softmax(composition_logits, dim=-1), ratio_targets)
+            batch_total_loss = 0.4 * batch_presence_loss + 0.6 * batch_composition_loss
 
-        if training:
-            batch_total_loss.backward()
-            optimizer.step()
+            if training:
+                batch_total_loss.backward()
+                optimizer.step()
 
-        total_presence += float(batch_presence_loss.detach())
-        total_composition += float(batch_composition_loss.detach())
-        total_loss += float(batch_total_loss.detach())
-        total_batches += 1
+        total_presence += float(batch_presence_loss.detach()) * batch_size
+        total_composition += float(batch_composition_loss.detach()) * batch_size
+        total_loss += float(batch_total_loss.detach()) * batch_size
+        total_samples += batch_size
 
         truth_presence.extend(presence_targets.detach().cpu().int().tolist())
         predicted_presence_probabilities.extend(torch.sigmoid(presence_logits).detach().cpu().tolist())
@@ -241,9 +260,9 @@ def _run_epoch(
 
     return {
         "losses": {
-            "presence_loss": total_presence / max(total_batches, 1),
-            "composition_loss": total_composition / max(total_batches, 1),
-            "total_loss": total_loss / max(total_batches, 1),
+            "presence_loss": total_presence / max(total_samples, 1),
+            "composition_loss": total_composition / max(total_samples, 1),
+            "total_loss": total_loss / max(total_samples, 1),
         },
         "truth_presence": truth_presence,
         "predicted_presence_probabilities": predicted_presence_probabilities,
@@ -264,6 +283,46 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
 def _load_json(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def _validate_split_definition(
+    records: list[dict[str, Any]],
+    split_definition: dict[str, Any],
+) -> dict[str, str]:
+    split_error = split_definition.get("error")
+    if split_error:
+        raise ValueError(f"split definition is invalid: {split_error}")
+    assignments = split_definition.get("assignments")
+    if not isinstance(assignments, dict):
+        raise ValueError("split definition does not contain an assignments object")
+    required_fabric_ids = {str(record["fabric_id"]) for record in records}
+    missing = sorted(required_fabric_ids - set(assignments))
+    if missing:
+        preview = ", ".join(missing[:5])
+        raise ValueError(f"split definition is missing {len(missing)} fabric ids: {preview}")
+    invalid = sorted(
+        fabric_id
+        for fabric_id in required_fabric_ids
+        if assignments.get(fabric_id) not in {"train", "val", "test"}
+    )
+    if invalid:
+        raise ValueError(f"split definition contains invalid assignments for: {', '.join(invalid[:5])}")
+    empty_splits = [
+        split_name
+        for split_name in ("train", "val", "test")
+        if not any(assignments[fabric_id] == split_name for fabric_id in required_fabric_ids)
+    ]
+    if empty_splits:
+        raise ValueError(f"split definition contains empty splits: {', '.join(empty_splits)}")
+    return {str(key): str(value) for key, value in assignments.items()}
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:

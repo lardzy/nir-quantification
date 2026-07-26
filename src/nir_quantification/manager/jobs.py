@@ -1,43 +1,67 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
+import os
+import tempfile
 import threading
+import time
 import traceback
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import sessionmaker
 
 from .config import ManagerSettings
 from .db import decode_json, encode_json, session_scope
 from .models import ClassAxisStat, ClassStat, Job, Spectrum
 from .parsers import ParserRegistry
-from .service import build_classification, job_to_dict, recompute_class_stats, spectrum_query, upsert_spectrum_from_parsed, utcnow
+from .service import build_classification, job_to_dict, recompute_class_stats, upsert_spectrum_from_parsed, utcnow
+
+
+MAX_JOB_LOG_CHARS = 200_000
 
 
 class SubsetStore:
-    def __init__(self) -> None:
+    def __init__(self, max_entries: int = 256, ttl_seconds: int = 3600) -> None:
         self._lock = threading.Lock()
-        self._subsets: dict[str, dict[str, Any]] = {}
+        self._subsets: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._spectrum_index: dict[int, set[str]] = {}
+        self._max_entries = max(1, max_entries)
+        self._ttl_seconds = max(60, ttl_seconds)
 
     def put(self, subset_id: str, payload: dict[str, Any]) -> None:
         with self._lock:
+            self._cleanup_locked()
+            self._remove_locked(subset_id)
+            payload["_last_access_at"] = time.monotonic()
             self._subsets[subset_id] = payload
             for spectrum_id in payload.get("spectrum_ids", []):
                 self._spectrum_index.setdefault(int(spectrum_id), set()).add(subset_id)
+            while len(self._subsets) > self._max_entries:
+                oldest_id = next(iter(self._subsets))
+                self._remove_locked(oldest_id)
 
     def get(self, subset_id: str) -> dict[str, Any] | None:
         with self._lock:
-            return self._subsets.get(subset_id)
+            self._cleanup_locked()
+            payload = self._subsets.get(subset_id)
+            if payload is not None:
+                payload["_last_access_at"] = time.monotonic()
+                self._subsets.move_to_end(subset_id)
+            return payload
 
     def get_summary(self, subset_id: str, excluded: str) -> dict[str, Any] | None:
         with self._lock:
+            self._cleanup_locked()
             payload = self._subsets.get(subset_id)
             if payload is None:
                 return None
+            payload["_last_access_at"] = time.monotonic()
+            self._subsets.move_to_end(subset_id)
             axis_counts = payload["axis_summary_by_filter"].get(excluded, {})
             items = [
                 {
@@ -56,6 +80,7 @@ class SubsetStore:
 
     def adjust_for_exclusion(self, spectrum: Spectrum, excluded: bool) -> None:
         with self._lock:
+            self._cleanup_locked()
             subset_ids = list(self._spectrum_index.get(int(spectrum.id), set()))
             if not subset_ids:
                 return
@@ -89,13 +114,68 @@ class SubsetStore:
                         if excluded_axis[axis_key] <= 0:
                             excluded_axis.pop(axis_key, None)
 
+    def _cleanup_locked(self) -> None:
+        cutoff = time.monotonic() - self._ttl_seconds
+        expired_ids = [
+            subset_id
+            for subset_id, payload in self._subsets.items()
+            if float(payload.get("_last_access_at", 0.0)) < cutoff
+        ]
+        for subset_id in expired_ids:
+            self._remove_locked(subset_id)
+
+    def _remove_locked(self, subset_id: str) -> None:
+        payload = self._subsets.pop(subset_id, None)
+        if payload is None:
+            return
+        for spectrum_id in payload.get("spectrum_ids", []):
+            indexed_subsets = self._spectrum_index.get(int(spectrum_id))
+            if indexed_subsets is None:
+                continue
+            indexed_subsets.discard(subset_id)
+            if not indexed_subsets:
+                self._spectrum_index.pop(int(spectrum_id), None)
+
 
 class JobManager:
     def __init__(self, settings: ManagerSettings, session_factory: sessionmaker, parser_registry: ParserRegistry) -> None:
         self.settings = settings
         self.session_factory = session_factory
         self.parser_registry = parser_registry
-        self.subsets = SubsetStore()
+        self.subsets = SubsetStore(
+            max_entries=settings.subset_cache_max_entries,
+            ttl_seconds=settings.subset_cache_ttl_seconds,
+        )
+        self._future_lock = threading.Lock()
+        self._futures = set()
+        self._executor = ThreadPoolExecutor(
+            max_workers=settings.max_concurrent_jobs,
+            thread_name_prefix="nirq-job",
+        )
+        self._closed = False
+        self.recover_interrupted_jobs()
+
+    def recover_interrupted_jobs(self) -> int:
+        finished_at = utcnow()
+        with session_scope(self.session_factory) as session:
+            result = session.execute(
+                update(Job)
+                .where(Job.status.in_(("pending", "running")))
+                .values(
+                    status="failed",
+                    finished_at=finished_at,
+                    updated_at=finished_at,
+                    progress_message="Interrupted by previous application shutdown",
+                )
+            )
+            return int(getattr(result, "rowcount", 0) or 0)
+
+    def shutdown(self, wait: bool = True) -> None:
+        with self._future_lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._executor.shutdown(wait=wait, cancel_futures=False)
 
     def ensure_class_stats(self) -> None:
         with session_scope(self.session_factory) as session:
@@ -298,8 +378,17 @@ class JobManager:
         }
 
     def _spawn(self, target, job_id: int) -> None:
-        thread = threading.Thread(target=target, kwargs={"job_id": job_id}, daemon=True)
-        thread.start()
+        with self._future_lock:
+            if self._closed:
+                raise RuntimeError("job manager is shutting down")
+            future = self._executor.submit(target, job_id=job_id)
+            self._futures.add(future)
+
+        def discard_future(completed_future) -> None:
+            with self._future_lock:
+                self._futures.discard(completed_future)
+
+        future.add_done_callback(discard_future)
 
     def _run_import_job(self, job_id: int) -> None:
         with session_scope(self.session_factory) as session:
@@ -315,19 +404,34 @@ class JobManager:
         try:
             paths = sorted(root_path.rglob("*.csv") if recursive else root_path.glob("*.csv"))
             unique_paths: list[Path] = []
-            seen_names: set[str] = set()
-            duplicate_paths: list[Path] = []
+            first_path_by_name: dict[str, Path] = {}
+            duplicate_logs: list[str] = []
+            duplicate_skipped = duplicate_failed = 0
             for path in paths:
-                if path.name in seen_names:
-                    duplicate_paths.append(path)
+                first_path = first_path_by_name.get(path.name)
+                if first_path is not None:
+                    try:
+                        same_content = hashlib.sha256(first_path.read_bytes()).digest() == hashlib.sha256(path.read_bytes()).digest()
+                    except OSError as error:
+                        duplicate_failed += 1
+                        duplicate_logs.append(f"[duplicate-read-error] {path}: {error}")
+                        continue
+                    if same_content:
+                        duplicate_skipped += 1
+                        duplicate_logs.append(f"[duplicate-file-name] {path.name}: identical duplicate skipped")
+                    else:
+                        duplicate_failed += 1
+                        duplicate_logs.append(
+                            f"[duplicate-file-name-conflict] {path.name}: same name has different content"
+                        )
                     continue
-                seen_names.add(path.name)
+                first_path_by_name[path.name] = path
                 unique_paths.append(path)
 
             imported = 0
-            skipped = len(duplicate_paths)
-            failed = 0
-            processed = len(duplicate_paths)
+            skipped = duplicate_skipped
+            failed = duplicate_failed
+            processed = duplicate_skipped + duplicate_failed
             self._update_job(
                 job_id,
                 total_discovered=len(paths),
@@ -335,49 +439,37 @@ class JobManager:
                 skipped_count=skipped,
                 progress_message=f"Found {len(paths)} CSV files",
             )
-            for path in duplicate_paths:
-                self._append_log(job_id, f"[duplicate-file-name] {path.name}: skipped duplicate discovered in import tree")
+            for log_message in duplicate_logs:
+                self._append_log(job_id, log_message)
 
             with ThreadPoolExecutor(max_workers=self.settings.max_workers) as executor:
-                future_map = {executor.submit(self.parser_registry.parse, path): path for path in unique_paths}
-                batch = []
-                for future in as_completed(future_map):
-                    path = future_map[future]
-                    try:
-                        batch.append(future.result())
-                    except Exception as error:
-                        failed += 1
-                        processed += 1
-                        self._append_log(job_id, f"[import-error] {path.name}: {error}")
-                        self._update_job(
-                            job_id,
-                            processed_count=processed,
-                            imported_count=imported,
-                            skipped_count=skipped,
-                            failed_count=failed,
-                            progress_message=f"Imported {imported}, skipped {skipped}, failed {failed}",
-                        )
-                        continue
-                    if len(batch) >= self.settings.job_batch_size:
-                        batch_imported, batch_skipped = self._flush_import_batch(batch)
-                        imported += batch_imported
-                        skipped += batch_skipped
-                        processed += len(batch)
-                        batch = []
-                        self._update_job(
-                            job_id,
-                            processed_count=processed,
-                            imported_count=imported,
-                            skipped_count=skipped,
-                            failed_count=failed,
-                            progress_message=f"Imported {imported}, skipped {skipped}, failed {failed}",
-                        )
+                chunk_size = max(self.settings.job_batch_size, self.settings.max_workers * 2)
+                for start in range(0, len(unique_paths), chunk_size):
+                    chunk = unique_paths[start : start + chunk_size]
+                    future_map = {executor.submit(self.parser_registry.parse, path): path for path in chunk}
+                    batch = []
+                    for future in as_completed(future_map):
+                        path = future_map.pop(future)
+                        try:
+                            batch.append(future.result())
+                        except Exception as error:
+                            failed += 1
+                            processed += 1
+                            self._append_log(job_id, f"[import-error] {path.name}: {error}")
 
-                if batch:
-                    batch_imported, batch_skipped = self._flush_import_batch(batch)
+                    batch_imported, batch_skipped, batch_failed = self._flush_import_batch(job_id, batch)
                     imported += batch_imported
                     skipped += batch_skipped
+                    failed += batch_failed
                     processed += len(batch)
+                    self._update_job(
+                        job_id,
+                        processed_count=processed,
+                        imported_count=imported,
+                        skipped_count=skipped,
+                        failed_count=failed,
+                        progress_message=f"Imported {imported}, skipped {skipped}, failed {failed}",
+                    )
 
             self._finish_job(
                 job_id,
@@ -392,14 +484,21 @@ class JobManager:
             self._append_log(job_id, traceback.format_exc())
             self._finish_job(job_id, status="failed", progress_message=str(error))
 
-    def _flush_import_batch(self, batch) -> tuple[int, int]:
-        imported = skipped = 0
+    def _flush_import_batch(self, job_id: int, batch) -> tuple[int, int, int]:
+        imported = skipped = failed = 0
         if not batch:
-            return imported, skipped
+            return imported, skipped, failed
         affected_class_keys: set[str] = set()
+        error_messages: list[str] = []
         with session_scope(self.session_factory) as session:
             for parsed in batch:
-                result = upsert_spectrum_from_parsed(session, parsed)
+                try:
+                    with session.begin_nested():
+                        result = upsert_spectrum_from_parsed(session, parsed)
+                except Exception as error:
+                    failed += 1
+                    error_messages.append(f"[import-conflict] {parsed.file_name}: {error}")
+                    continue
                 if result == "imported":
                     imported += 1
                     affected_class_keys.add(build_classification(parsed.labels)[0])
@@ -407,7 +506,9 @@ class JobManager:
                     skipped += 1
             if affected_class_keys:
                 recompute_class_stats(session, sorted(affected_class_keys))
-        return imported, skipped
+        for message in error_messages:
+            self._append_log(job_id, message)
+        return imported, skipped, failed
 
     def _run_export_job(self, job_id: int) -> None:
         with session_scope(self.session_factory) as session:
@@ -421,38 +522,61 @@ class JobManager:
             job.started_at = utcnow()
             job.progress_message = "Preparing export"
 
-            stmt = spectrum_query(session, None, "all" if scope == "all" else scope, None)
+            filters = []
+            if scope == "active":
+                filters.append(Spectrum.is_excluded.is_(False))
+            elif scope == "excluded":
+                filters.append(Spectrum.is_excluded.is_(True))
             if class_keys:
-                stmt = stmt.where(Spectrum.class_key.in_(class_keys))
-            spectra = session.scalars(stmt).unique().all()
-            payload = [
-                {
-                    "file_name": spectrum.file_name,
-                    "class_display_name": spectrum.class_display_name,
-                    "raw_csv_gzip": spectrum.raw_csv_gzip,
-                }
-                for spectrum in spectra
-            ]
+                filters.append(Spectrum.class_key.in_(class_keys))
+            total_count = int(session.scalar(select(func.count(Spectrum.id)).where(*filters)) or 0)
         export_root.mkdir(parents=True, exist_ok=True)
-        self._update_job(job_id, total_discovered=len(payload), progress_message=f"Exporting {len(payload)} files")
+        self._update_job(job_id, total_discovered=total_count, progress_message=f"Exporting {total_count} files")
 
         written = failed = 0
         try:
             with ThreadPoolExecutor(max_workers=self.settings.max_workers) as executor:
-                future_map = {
-                    executor.submit(self._write_export_file, export_root, scope, item): item["file_name"]
-                    for item in payload
-                }
-                for completed, future in enumerate(as_completed(future_map), start=1):
-                    try:
-                        future.result()
-                        written += 1
-                    except Exception as error:
-                        failed += 1
-                        self._append_log(job_id, f"[export-error] {future_map[future]}: {error}")
+                last_id = 0
+                while True:
+                    with session_scope(self.session_factory) as session:
+                        rows = session.execute(
+                            select(
+                                Spectrum.id,
+                                Spectrum.file_name,
+                                Spectrum.class_display_name,
+                                Spectrum.raw_csv_gzip,
+                            )
+                            .where(Spectrum.id > last_id, *filters)
+                            .order_by(Spectrum.id.asc())
+                            .limit(self.settings.job_batch_size)
+                        ).all()
+                        payload = [
+                            {
+                                "id": int(row.id),
+                                "file_name": row.file_name,
+                                "class_display_name": row.class_display_name,
+                                "raw_csv_gzip": row.raw_csv_gzip,
+                            }
+                            for row in rows
+                        ]
+                    if not payload:
+                        break
+                    last_id = int(payload[-1]["id"])
+                    future_map = {
+                        executor.submit(self._write_export_file, export_root, scope, item): item["file_name"]
+                        for item in payload
+                    }
+                    for future in as_completed(future_map):
+                        file_name = future_map.pop(future)
+                        try:
+                            future.result()
+                            written += 1
+                        except Exception as error:
+                            failed += 1
+                            self._append_log(job_id, f"[export-error] {file_name}: {error}")
                     self._update_job(
                         job_id,
-                        processed_count=completed,
+                        processed_count=written + failed,
                         imported_count=written,
                         failed_count=failed,
                         progress_message=f"Exported {written}, failed {failed}",
@@ -460,7 +584,7 @@ class JobManager:
             self._finish_job(
                 job_id,
                 status="completed",
-                processed_count=len(payload),
+                processed_count=written + failed,
                 imported_count=written,
                 failed_count=failed,
                 progress_message=f"Completed export: {written} written, {failed} failed",
@@ -496,8 +620,25 @@ class JobManager:
     def _write_export_file(self, export_root: Path, scope: str, item: dict[str, Any]) -> None:
         target_dir = export_root / scope / _safe_dir_name(item["class_display_name"] or "未分类")
         target_dir.mkdir(parents=True, exist_ok=True)
-        raw_text = gzip.decompress(item["raw_csv_gzip"]).decode("utf-8")
-        (target_dir / item["file_name"]).write_text(raw_text, encoding="utf-8")
+        raw_bytes = gzip.decompress(item["raw_csv_gzip"])
+        target_path = target_dir / item["file_name"]
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=target_dir,
+                prefix=f".{target_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+                handle.write(raw_bytes)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, target_path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
     def _update_job(self, job_id: int, **fields) -> None:
         with session_scope(self.session_factory) as session:
@@ -513,7 +654,7 @@ class JobManager:
             if job is None:
                 return
             existing = job.log_text or ""
-            job.log_text = f"{existing}{message}\n"
+            job.log_text = f"{existing}{message}\n"[-MAX_JOB_LOG_CHARS:]
 
     def _finish_job(self, job_id: int, status: str, progress_message: str, **fields) -> None:
         with session_scope(self.session_factory) as session:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import time
 import unittest
+import gzip
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -10,7 +11,9 @@ from fastapi.testclient import TestClient
 from nir_quantification.manager.app import create_app
 from nir_quantification.manager.config import ManagerSettings
 from nir_quantification.manager.db import session_scope
-from nir_quantification.manager.models import ClassAxisStat, ClassStat
+from nir_quantification.manager.jobs import SubsetStore
+from nir_quantification.manager.models import ClassAxisStat, ClassStat, Job, Spectrum
+from nir_quantification.manager.service import transition_spectrum_exclusion
 
 
 def make_csv_text(labels: list[tuple[str, float]], point_count: int = 228) -> str:
@@ -252,6 +255,149 @@ class ManagerTests(unittest.TestCase):
         exported_path = exported_candidates[0]
         self.assertTrue(exported_path.exists())
         self.assertEqual(exported_path.read_text(encoding="utf-8"), original_text)
+
+    def test_export_preserves_original_csv_bytes(self) -> None:
+        file_name = "ISC_Hadamard 1_棉,100.0_ABC123_20240101_120000_1.csv"
+        original_bytes = ("\ufeff" + make_csv_text([("棉", 100.0)]).replace("\n", "\r\n")).encode("utf-8")
+        (self.import_root / file_name).write_bytes(original_bytes)
+
+        import_job = self.client.post(
+            "/api/import-jobs",
+            json={"root_path": str(self.import_root), "recursive": True},
+        ).json()
+        self._wait_for_job(import_job["id"])
+        export_job = self.client.post(
+            "/api/export-jobs",
+            json={"export_root": str(self.export_root), "scope": "active", "class_keys": []},
+        ).json()
+        self._wait_for_job(export_job["id"])
+
+        exported_path = next((self.export_root / "active").rglob(file_name))
+        self.assertEqual(exported_path.read_bytes(), original_bytes)
+        with session_scope(self.client.app.state.session_factory) as session:
+            stored = session.query(Spectrum).filter_by(file_name=file_name).one()
+            self.assertEqual(gzip.decompress(stored.raw_csv_gzip), original_bytes)
+            self.assertIsNotNone(stored.content_sha256)
+
+    def test_same_file_name_with_different_content_is_not_silently_accepted(self) -> None:
+        file_name = "ISC_Hadamard 1_棉,100.0_ABC123_20240101_120000_1.csv"
+        path = self.import_root / file_name
+        path.write_text(make_csv_text([("棉", 100.0)]), encoding="utf-8")
+        first_job = self.client.post(
+            "/api/import-jobs",
+            json={"root_path": str(self.import_root), "recursive": True},
+        ).json()
+        self._wait_for_job(first_job["id"])
+
+        path.write_text(
+            make_csv_text([("棉", 100.0)]).replace("0.100000", "0.900000", 1),
+            encoding="utf-8",
+        )
+        second_job = self.client.post(
+            "/api/import-jobs",
+            json={"root_path": str(self.import_root), "recursive": True},
+        ).json()
+        completed = self._wait_for_job(second_job["id"])
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["failed_count"], 1)
+        self.assertIn("file name conflict", completed["log_text"])
+
+    def test_stale_concurrent_exclusion_only_adjusts_counters_once(self) -> None:
+        file_name = "ISC_Hadamard 1_棉,100.0_ABC123_20240101_120000_1.csv"
+        (self.import_root / file_name).write_text(make_csv_text([("棉", 100.0)]), encoding="utf-8")
+        job = self.client.post(
+            "/api/import-jobs",
+            json={"root_path": str(self.import_root), "recursive": True},
+        ).json()
+        self._wait_for_job(job["id"])
+
+        session_factory = self.client.app.state.session_factory
+        first_session = session_factory()
+        second_session = session_factory()
+        try:
+            spectrum_id = first_session.query(Spectrum.id).scalar()
+            assert spectrum_id is not None
+            first_session.get(Spectrum, spectrum_id)
+            second_session.get(Spectrum, spectrum_id)
+
+            first_spectrum, first_changed = transition_spectrum_exclusion(
+                first_session,
+                spectrum_id,
+                excluded=True,
+            )
+            first_session.commit()
+            second_spectrum, second_changed = transition_spectrum_exclusion(
+                second_session,
+                spectrum_id,
+                excluded=True,
+            )
+            second_session.commit()
+
+            self.assertTrue(first_changed)
+            self.assertFalse(second_changed)
+            assert first_spectrum is not None and second_spectrum is not None
+            self.assertTrue(first_spectrum.is_excluded)
+            self.assertTrue(second_spectrum.is_excluded)
+        finally:
+            first_session.close()
+            second_session.close()
+
+        with session_scope(session_factory) as session:
+            class_stat = session.get(ClassStat, "棉")
+            assert class_stat is not None
+            self.assertEqual(class_stat.total_count, 1)
+            self.assertEqual(class_stat.active_count, 0)
+            self.assertEqual(class_stat.excluded_count, 1)
+
+    def test_spectra_response_respects_point_budget(self) -> None:
+        for index in range(2):
+            file_name = f"ISC_Hadamard 1_棉,100.0_ABC12{index}_20240101_12000{index}_1.csv"
+            (self.import_root / file_name).write_text(make_csv_text([("棉", 100.0)]), encoding="utf-8")
+        job = self.client.post(
+            "/api/import-jobs",
+            json={"root_path": str(self.import_root), "recursive": True},
+        ).json()
+        self._wait_for_job(job["id"])
+
+        self.client.app.state.settings.max_preview_points = 300
+        payload = self.client.get(
+            "/api/spectra",
+            params={"class_key": "棉", "excluded": "active", "limit": 2000},
+        ).json()
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(len(payload["items"]), 1)
+        self.assertEqual(payload["returned_point_count"], 228)
+        self.assertEqual(payload["point_budget"], 300)
+        self.assertTrue(payload["truncated_by_point_budget"])
+
+    def test_startup_recovery_marks_interrupted_jobs_failed(self) -> None:
+        with session_scope(self.client.app.state.session_factory) as session:
+            interrupted = Job(
+                type="import",
+                status="running",
+                params_json="{}",
+                stats_json="{}",
+                progress_message="Working",
+            )
+            session.add(interrupted)
+            session.flush()
+            job_id = interrupted.id
+
+        recovered = self.client.app.state.job_manager.recover_interrupted_jobs()
+        self.assertEqual(recovered, 1)
+        with session_scope(self.client.app.state.session_factory) as session:
+            job = session.get(Job, job_id)
+            assert job is not None
+            self.assertEqual(job.status, "failed")
+            self.assertIsNotNone(job.finished_at)
+            self.assertIn("previous application shutdown", job.progress_message)
+
+    def test_subset_store_evicts_least_recently_used_entries(self) -> None:
+        store = SubsetStore(max_entries=1, ttl_seconds=3600)
+        store.put("first", {"spectrum_ids": [1]})
+        store.put("second", {"spectrum_ids": [2]})
+        self.assertIsNone(store.get("first"))
+        self.assertIsNotNone(store.get("second"))
 
     def test_imports_fourier_and_grating_formats_with_axis_summary(self) -> None:
         fourier_name = "样品编号 230340227  2025-09-09 083855 GMT+0800.csv"

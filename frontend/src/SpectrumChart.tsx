@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import * as echarts from "echarts";
-import type { EChartsType } from "echarts";
+import { LineChart } from "echarts/charts";
+import { DataZoomComponent, GridComponent, TooltipComponent } from "echarts/components";
+import * as echarts from "echarts/core";
+import type { EChartsType } from "echarts/core";
+import { CanvasRenderer } from "echarts/renderers";
 import { Tag } from "antd";
 import {
   buildHitTestSpectra,
@@ -13,6 +16,8 @@ import {
 } from "./chartInteraction";
 import type { HitTestSpectrum } from "./chartInteraction";
 import type { SpectrumItem } from "./types";
+
+echarts.use([LineChart, GridComponent, DataZoomComponent, TooltipComponent, CanvasRenderer]);
 
 type HoverPreview = {
   spectrum: SpectrumItem;

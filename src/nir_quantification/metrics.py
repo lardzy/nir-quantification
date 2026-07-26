@@ -12,15 +12,37 @@ from .postprocess import postprocess_prediction
 def search_best_threshold(
     truth_presence: list[list[int]],
     predicted_presence_probabilities: list[list[float]],
+    predicted_composition_probabilities: list[list[float]] | None = None,
 ) -> float:
+    composition_probabilities = (
+        predicted_composition_probabilities
+        if predicted_composition_probabilities is not None
+        else predicted_presence_probabilities
+    )
+    _validate_prediction_shapes(
+        truth_presence,
+        predicted_presence_probabilities,
+        composition_probabilities,
+    )
     best_threshold = 0.5
     best_micro_f1 = -1.0
     best_macro_f1 = -1.0
     for step in range(5, 96):
         threshold = step / 100.0
+        processed_predictions = [
+            postprocess_prediction(
+                presence_probabilities=presence_row,
+                composition_probabilities=composition_row,
+                threshold=threshold,
+            )
+            for presence_row, composition_row in zip(
+                predicted_presence_probabilities,
+                composition_probabilities,
+            )
+        ]
         predicted_binary = [
-            [1 if probability >= threshold else 0 for probability in row]
-            for row in predicted_presence_probabilities
+            [1 if index in processed["candidate_indices"] else 0 for index in range(len(FIBER_CLASSES))]
+            for processed in processed_predictions
         ]
         micro = micro_f1_score(truth_presence, predicted_binary)
         macro = macro_f1_score(truth_presence, predicted_binary)
@@ -39,20 +61,31 @@ def evaluate_split(
     split_name: str,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     truth_presence = [record["present_14"] for record in records]
+    _validate_prediction_shapes(
+        truth_presence,
+        predicted_presence_probabilities,
+        predicted_composition_probabilities,
+    )
+    processed_predictions = [
+        postprocess_prediction(
+            presence_probabilities=presence_probs,
+            composition_probabilities=composition_probs,
+            threshold=threshold,
+        )
+        for presence_probs, composition_probs in zip(
+            predicted_presence_probabilities,
+            predicted_composition_probabilities,
+        )
+    ]
     predicted_presence = [
-        [1 if probability >= threshold else 0 for probability in row]
-        for row in predicted_presence_probabilities
+        [1 if index in processed["candidate_indices"] else 0 for index in range(len(FIBER_CLASSES))]
+        for processed in processed_predictions
     ]
     per_class_rows = presence_class_report(truth_presence, predicted_presence)
 
     predicted_dense = []
     sample_rows = []
-    for record, presence_probs, composition_probs in zip(records, predicted_presence_probabilities, predicted_composition_probabilities):
-        processed = postprocess_prediction(
-            presence_probabilities=presence_probs,
-            composition_probabilities=composition_probs,
-            threshold=threshold,
-        )
+    for record, processed in zip(records, processed_predictions):
         dense = processed["dense_percentages"]
         predicted_dense.append(dense)
         sample_rows.append(
@@ -73,8 +106,21 @@ def evaluate_split(
     overall_metrics = {
         "presence_micro_f1": micro_f1_score(truth_presence, predicted_presence),
         "presence_macro_f1": macro_f1_score(truth_presence, predicted_presence),
+        "presence_macro_f1_all_classes": macro_f1_score(
+            truth_presence,
+            predicted_presence,
+            supported_only=False,
+        ),
         "overall_mae": mean_absolute_error([record["composition_14"] for record in records], predicted_dense),
         "overall_rmse": root_mean_squared_error([record["composition_14"] for record in records], predicted_dense),
+        "mean_sample_l1_error": mean_sample_l1_error(
+            [record["composition_14"] for record in records],
+            predicted_dense,
+        ),
+        "mean_sample_total_variation_error": mean_sample_total_variation_error(
+            [record["composition_14"] for record in records],
+            predicted_dense,
+        ),
         "dominant_fiber_accuracy": dominant_fiber_accuracy(records, predicted_dense),
         "bucket_metrics": bucket_metrics(records, predicted_dense),
     }
@@ -132,8 +178,15 @@ def micro_f1_score(truth_presence: list[list[int]], predicted_presence: list[lis
     return _f1(precision, recall)
 
 
-def macro_f1_score(truth_presence: list[list[int]], predicted_presence: list[list[int]]) -> float:
+def macro_f1_score(
+    truth_presence: list[list[int]],
+    predicted_presence: list[list[int]],
+    *,
+    supported_only: bool = True,
+) -> float:
     rows = presence_class_report(truth_presence, predicted_presence)
+    if supported_only:
+        rows = [row for row in rows if row["support"] > 0]
     return sum(row["f1"] for row in rows) / len(rows) if rows else 0.0
 
 
@@ -155,6 +208,21 @@ def root_mean_squared_error(truth_vectors: list[list[float]], predicted_vectors:
             total += (truth_value - predicted_value) ** 2
             count += 1
     return math.sqrt(total / count) if count else 0.0
+
+
+def mean_sample_l1_error(truth_vectors: list[list[float]], predicted_vectors: list[list[float]]) -> float:
+    sample_errors = [
+        sum(abs(truth_value - predicted_value) for truth_value, predicted_value in zip(truth_row, predicted_row))
+        for truth_row, predicted_row in zip(truth_vectors, predicted_vectors)
+    ]
+    return sum(sample_errors) / len(sample_errors) if sample_errors else 0.0
+
+
+def mean_sample_total_variation_error(
+    truth_vectors: list[list[float]],
+    predicted_vectors: list[list[float]],
+) -> float:
+    return mean_sample_l1_error(truth_vectors, predicted_vectors) / 2.0
 
 
 def per_class_mae(truth_vectors: list[list[float]], predicted_vectors: list[list[float]]) -> list[float]:
@@ -218,3 +286,24 @@ def _vector_to_ranked(vector: list[float]) -> list[dict[str, float]]:
     ]
     ranked.sort(key=lambda item: item["percentage"], reverse=True)
     return ranked
+
+
+def _validate_prediction_shapes(
+    truth_presence: list[list[int]],
+    predicted_presence_probabilities: list[list[float]],
+    predicted_composition_probabilities: list[list[float]],
+) -> None:
+    sample_count = len(truth_presence)
+    if (
+        len(predicted_presence_probabilities) != sample_count
+        or len(predicted_composition_probabilities) != sample_count
+    ):
+        raise ValueError("prediction sample count does not match the truth sample count")
+    expected_width = len(FIBER_CLASSES)
+    for name, rows in (
+        ("truth", truth_presence),
+        ("presence", predicted_presence_probabilities),
+        ("composition", predicted_composition_probabilities),
+    ):
+        if any(len(row) != expected_width for row in rows):
+            raise ValueError(f"{name} vectors must contain exactly {expected_width} classes")

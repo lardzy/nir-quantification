@@ -34,6 +34,17 @@ class SplittingTests(unittest.TestCase):
         for split_name in ("train", "val", "test"):
             self.assertTrue(split_definition["splits"][split_name])
 
+    def test_reports_when_three_way_class_coverage_is_impossible(self) -> None:
+        records = [
+            {
+                **make_record(f"group_{index}", 1),
+                "present_14": [1, 0] + [0] * 12,
+            }
+            for index in range(2)
+        ]
+        with self.assertRaisesRegex(ValueError, "classes with fewer than 3 independent fabric groups"):
+            build_split_definition(records)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -19,6 +19,10 @@ class ManagerSettings:
     static_dir: Path | None
     max_workers: int
     job_batch_size: int
+    max_concurrent_jobs: int = 1
+    subset_cache_max_entries: int = 256
+    subset_cache_ttl_seconds: int = 3600
+    max_preview_points: int = 500_000
 
     def __post_init__(self) -> None:
         self.db_path = self.db_path.expanduser().resolve()
@@ -43,4 +47,8 @@ class ManagerSettings:
             static_dir=static_dir if static_dir.exists() else None,
             max_workers=max_workers,
             job_batch_size=50,
+            max_concurrent_jobs=max(1, int(os.environ.get("NIRQ_MAX_CONCURRENT_JOBS", "1"))),
+            subset_cache_max_entries=max(1, int(os.environ.get("NIRQ_SUBSET_CACHE_MAX_ENTRIES", "256"))),
+            subset_cache_ttl_seconds=max(60, int(os.environ.get("NIRQ_SUBSET_CACHE_TTL_SECONDS", "3600"))),
+            max_preview_points=max(10_000, int(os.environ.get("NIRQ_MAX_PREVIEW_POINTS", "500000"))),
         )

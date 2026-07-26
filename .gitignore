@@ -6,6 +6,7 @@ __pycache__/
 outputs/
 artifacts/
 frontend/node_modules/
+/node_modules/
 frontend/dist/
 data/
 exports/

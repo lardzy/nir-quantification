@@ -2,7 +2,15 @@ services:
   nirq-web:
     build: .
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
+    user: "${NIRQ_UID:-1000}:${NIRQ_GID:-1000}"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     environment:
       NIRQ_DB_PATH: /data/spectra.sqlite3
       IMPORT_ROOTS: /workspace/imports
@@ -11,4 +19,4 @@ services:
     volumes:
       - ./data:/data
       - ./exports:/workspace/exports
-      - ./.temp:/workspace/imports
+      - ./.temp:/workspace/imports:ro

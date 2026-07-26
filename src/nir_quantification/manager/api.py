@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from pathlib import Path
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -17,16 +16,14 @@ from .db import decode_json, session_scope
 from .jobs import JobManager
 from .models import Job, Spectrum
 from .service import (
-    adjust_class_stats_for_exclusion,
     class_stats_status,
     fetch_recent_excluded,
     fetch_spectra,
     job_to_dict,
     list_classes,
     spectra_summary,
-    spectrum_query,
     spectrum_to_dict,
-    utcnow,
+    transition_spectrum_exclusion,
 )
 
 
@@ -55,8 +52,9 @@ def create_router(settings: ManagerSettings, session_factory: sessionmaker, job_
             yield session
 
     @router.get("/health")
-    def health() -> dict:
-        return {"status": "ok"}
+    def health(session: Session = Depends(get_session)) -> dict:
+        session.execute(select(1))
+        return {"status": "ok", "database": "ok", "jobs": "accepting"}
 
     @router.get("/fs/roots")
     def roots() -> dict:
@@ -184,7 +182,7 @@ def create_router(settings: ManagerSettings, session_factory: sessionmaker, job_
                 raise HTTPException(status_code=404, detail="subset not found")
             subset_spectrum_ids = list(subset["spectrum_ids"])
         summary = spectra_summary(session, class_key, excluded, component_count, axis_kind, subset_spectrum_ids)
-        spectra_items = fetch_spectra(
+        spectra_items, point_budget_truncated, returned_point_count = fetch_spectra(
             session,
             class_key=class_key,
             excluded=excluded,
@@ -192,38 +190,44 @@ def create_router(settings: ManagerSettings, session_factory: sessionmaker, job_
             axis_kind=axis_kind,
             subset_spectrum_ids=subset_spectrum_ids,
             limit=limit,
+            max_total_points=settings.max_preview_points,
         )
+        all_axes_summary = summary["axis_summary"]
+        if axis_kind is not None:
+            all_axes_summary = spectra_summary(
+                session,
+                class_key,
+                excluded,
+                component_count,
+                None,
+                subset_spectrum_ids,
+            )["axis_summary"]
         return {
             "items": spectra_items,
             "count": summary["total_count"],
             "limit": limit,
-            "axis_summary": spectra_summary(session, class_key, excluded, component_count, None, subset_spectrum_ids)["axis_summary"],
+            "axis_summary": all_axes_summary,
+            "point_budget": settings.max_preview_points,
+            "returned_point_count": returned_point_count,
+            "truncated_by_point_budget": point_budget_truncated,
         }
 
     @router.post("/spectra/{spectrum_id}/exclude")
     def exclude_spectrum(spectrum_id: int, session: Session = Depends(get_session)) -> dict:
-        spectrum = session.get(Spectrum, spectrum_id)
+        spectrum, changed = transition_spectrum_exclusion(session, spectrum_id, excluded=True)
         if spectrum is None:
             raise HTTPException(status_code=404, detail="spectrum not found")
-        if spectrum.is_excluded:
-            return spectrum_to_dict(spectrum)
-        spectrum.is_excluded = True
-        spectrum.excluded_at = utcnow()
-        adjust_class_stats_for_exclusion(session, spectrum, excluded=True)
-        job_manager.subsets.adjust_for_exclusion(spectrum, excluded=True)
+        if changed:
+            job_manager.subsets.adjust_for_exclusion(spectrum, excluded=True)
         return spectrum_to_dict(spectrum)
 
     @router.post("/spectra/{spectrum_id}/restore")
     def restore_spectrum(spectrum_id: int, session: Session = Depends(get_session)) -> dict:
-        spectrum = session.get(Spectrum, spectrum_id)
+        spectrum, changed = transition_spectrum_exclusion(session, spectrum_id, excluded=False)
         if spectrum is None:
             raise HTTPException(status_code=404, detail="spectrum not found")
-        if not spectrum.is_excluded:
-            return spectrum_to_dict(spectrum)
-        spectrum.is_excluded = False
-        spectrum.excluded_at = None
-        adjust_class_stats_for_exclusion(session, spectrum, excluded=False)
-        job_manager.subsets.adjust_for_exclusion(spectrum, excluded=False)
+        if changed:
+            job_manager.subsets.adjust_for_exclusion(spectrum, excluded=False)
         return spectrum_to_dict(spectrum)
 
     @router.post("/classes/{class_key:path}/subsets")

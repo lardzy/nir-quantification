@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import math
-import re
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -18,7 +17,7 @@ from .constants import (
 )
 
 
-NUMERIC_PATTERN = re.compile(r"^-?\d+(\.\d+)?$")
+WAVELENGTH_COVERAGE_TOLERANCE = 1.0
 
 
 def parse_csv_file(path: str | Path, require_labels: bool = True) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
@@ -33,6 +32,18 @@ def parse_csv_file(path: str | Path, require_labels: bool = True) -> tuple[dict[
             return None, _reject(csv_path, "invalid_scan_length", f"expected {FIXED_GRID_SIZE} points, got {len(wavelengths)}")
         if not _is_monotonic_increasing(wavelengths):
             return None, _reject(csv_path, "non_monotonic_wavelengths", "wavelength sequence is not strictly increasing")
+        if (
+            wavelengths[0] > FIXED_WAVELENGTHS[0] + WAVELENGTH_COVERAGE_TOLERANCE
+            or wavelengths[-1] < FIXED_WAVELENGTHS[-1] - WAVELENGTH_COVERAGE_TOLERANCE
+        ):
+            return None, _reject(
+                csv_path,
+                "insufficient_wavelength_coverage",
+                (
+                    f"scan range {wavelengths[0]:.4f}-{wavelengths[-1]:.4f} nm does not cover "
+                    f"{FIXED_WAVELENGTHS[0]:.4f}-{FIXED_WAVELENGTHS[-1]:.4f} nm"
+                ),
+            )
 
         footer_labels = _parse_footer_labels(footer_rows, csv_path, require_labels=require_labels)
         if footer_labels is None:
@@ -177,10 +188,13 @@ def _parse_scan_rows(scan_rows: list[list[str]]) -> tuple[list[float], list[floa
             continue
         if not _looks_like_numeric_row(row[:4]):
             continue
-        wavelengths.append(float(row[0]))
-        absorbance.append(float(row[1]))
-        reference_signal.append(float(row[2]))
-        sample_signal.append(float(row[3]))
+        values = [float(cell.strip()) for cell in row[:4]]
+        if not all(math.isfinite(value) for value in values):
+            raise ParseError("invalid_scan_data", "scan data contains NaN or infinite values")
+        wavelengths.append(values[0])
+        absorbance.append(values[1])
+        reference_signal.append(values[2])
+        sample_signal.append(values[3])
     return wavelengths, absorbance, reference_signal, sample_signal
 
 
@@ -195,6 +209,8 @@ def _parse_footer_labels(footer_rows: list[list[str]], csv_path: Path, require_l
             value = float(value_text)
         except ValueError as error:
             raise ParseError("invalid_label_value", f"invalid label value in {csv_path.name}: {value_text}") from error
+        if not math.isfinite(value) or value <= 0:
+            raise ParseError("invalid_label_value", f"label values must be finite and positive: {value_text}")
         labels.append((name, value))
     if not labels:
         return [] if not require_labels else None
@@ -204,6 +220,8 @@ def _parse_footer_labels(footer_rows: list[list[str]], csv_path: Path, require_l
 def _build_composition_vector(labels: list[tuple[str, float]], csv_path: Path) -> tuple[list[float], dict[str, float]]:
     merged = Counter()
     for raw_name, value in labels:
+        if not math.isfinite(value) or value <= 0:
+            raise ParseError("invalid_label_value", f"label values must be finite and positive: {raw_name}={value}")
         normalized_name = normalize_fiber_name(raw_name)
         if normalized_name is None:
             raise ParseError("unknown_fiber_label", f"unknown fiber label: {raw_name}")
@@ -241,6 +259,11 @@ def _parse_filename_labels(label_segment: str, csv_path: Path) -> dict[str, floa
             value = float(tokens[index + 1])
         except ValueError:
             raise ParseError("filename_label_parse_error", f"filename label value is invalid in {csv_path.name}")
+        if not math.isfinite(value) or value <= 0:
+            raise ParseError(
+                "filename_label_parse_error",
+                f"filename label values must be finite and positive in {csv_path.name}",
+            )
         merged[normalized_name] += value
     total = sum(merged.values())
     if total <= 0:

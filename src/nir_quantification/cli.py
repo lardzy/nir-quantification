@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 
@@ -26,7 +27,7 @@ def main(argv: list[str] | None = None) -> int:
     predict_parser.add_argument("--bundle", required=True)
 
     web_parser = subparsers.add_parser("web", help="Run the spectrum management web application")
-    web_parser.add_argument("--host", default="0.0.0.0")
+    web_parser.add_argument("--host", default="127.0.0.1")
     web_parser.add_argument("--port", type=int, default=8000)
 
     args = parser.parse_args(argv)
@@ -42,6 +43,9 @@ def main(argv: list[str] | None = None) -> int:
             splits_out=args.splits_out,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        if result["split_error"] is not None:
+            print(f"split generation failed: {result['split_error']}", file=sys.stderr)
+            return 2
         return 0
 
     if args.command == "train":
@@ -90,6 +94,11 @@ def main(argv: list[str] | None = None) -> int:
 
         settings = ManagerSettings.from_env()
         app = create_app(settings)
+        if args.host not in {"127.0.0.1", "::1", "localhost"}:
+            print(
+                "warning: the manager has no built-in authentication; place it behind an authenticated reverse proxy",
+                file=sys.stderr,
+            )
         uvicorn.run(app, host=args.host, port=args.port)
         return 0
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +37,7 @@ def build_manifest_bundle(
     split_definition: dict[str, Any] | None = None
     try:
         split_definition = build_split_definition(accepted_records)
-    except Exception as error:  # pragma: no cover - exercised through CLI/manual runs
+    except ValueError as error:
         split_error = str(error)
 
     audit_report = build_audit_report(accepted_records, rejections)

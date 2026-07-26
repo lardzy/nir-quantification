@@ -25,6 +25,7 @@ class Spectrum(Base):
     file_name: Mapped[str] = mapped_column(String(512), unique=True, index=True)
     source_path_last_seen: Mapped[str] = mapped_column(Text)
     raw_csv_gzip: Mapped[bytes] = mapped_column(LargeBinary)
+    content_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     metadata_json: Mapped[str] = mapped_column(Text)
     axis_kind: Mapped[str] = mapped_column(String(64))
     axis_unit: Mapped[str] = mapped_column(String(64))

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import random
-from collections import defaultdict
 from typing import Any
 
 
 def build_split_definition(records: list[dict[str, Any]], ratios: tuple[float, float, float] = (0.8, 0.1, 0.1)) -> dict[str, Any]:
     if not records:
         raise ValueError("cannot build split definition from an empty manifest")
+    if len(ratios) != 3 or any(ratio <= 0 for ratio in ratios):
+        raise ValueError("split ratios must contain three positive values")
+    if abs(sum(ratios) - 1.0) > 1e-9:
+        raise ValueError(f"split ratios must sum to 1.0, got {sum(ratios):.6f}")
 
     groups = _group_records(records)
     total_samples = len(records)
@@ -22,6 +25,8 @@ def build_split_definition(records: list[dict[str, Any]], ratios: tuple[float, f
     for group in groups.values():
         global_classes.update(group["classes"])
         global_buckets.update(group["buckets"])
+
+    _validate_coverage_feasibility(groups, global_classes, global_buckets)
 
     for seed in range(100):
         assignments, split_counts, split_classes, split_buckets = _assign_groups_with_seed(
@@ -48,6 +53,45 @@ def build_split_definition(records: list[dict[str, Any]], ratios: tuple[float, f
             }
 
     raise ValueError("failed to find a split in seeds 0..99 that preserves class and bucket coverage")
+
+
+def _validate_coverage_feasibility(
+    groups: dict[str, dict[str, Any]],
+    global_classes: set[int],
+    global_buckets: set[int],
+) -> None:
+    required_group_count = 3
+    class_group_counts = {
+        class_index: sum(class_index in group["classes"] for group in groups.values())
+        for class_index in global_classes
+    }
+    bucket_group_counts = {
+        bucket: sum(bucket in group["buckets"] for group in groups.values())
+        for bucket in global_buckets
+    }
+    scarce_classes = {
+        class_index: count
+        for class_index, count in class_group_counts.items()
+        if count < required_group_count
+    }
+    scarce_buckets = {
+        bucket: count
+        for bucket, count in bucket_group_counts.items()
+        if count < required_group_count
+    }
+    if scarce_classes or scarce_buckets:
+        details = []
+        if scarce_classes:
+            details.append(
+                "classes with fewer than 3 independent fabric groups: "
+                + ", ".join(f"{class_index}={count}" for class_index, count in sorted(scarce_classes.items()))
+            )
+        if scarce_buckets:
+            details.append(
+                "component buckets with fewer than 3 independent fabric groups: "
+                + ", ".join(f"{bucket}={count}" for bucket, count in sorted(scarce_buckets.items()))
+            )
+        raise ValueError("three-way coverage is impossible; " + "; ".join(details))
 
 
 def _group_records(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:

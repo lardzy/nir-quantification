@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import csv
 import gzip
+import hashlib
+import math
 import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from ..constants import FIBER_CLASSES, normalize_fiber_name
+from ..constants import LABEL_SUM_TARGET, LABEL_SUM_TOLERANCE, FIBER_CLASSES, normalize_fiber_name
 from ..parser import parse_csv_file
 
 
@@ -30,6 +32,7 @@ class ParsedSpectrum:
     file_name: str
     source_path: str
     raw_csv_gzip: bytes
+    content_sha256: str
     metadata: dict
     axis_kind: str
     axis_unit: str
@@ -50,12 +53,14 @@ class NIRCsvParser:
         if path.suffix.lower() != ".csv":
             return False
         try:
-            return "***Scan Data***" in path.read_text(encoding="utf-8-sig", errors="ignore")
+            with path.open("rb") as handle:
+                prefix = handle.read(64 * 1024)
+            return b"***Scan Data***" in prefix
         except OSError:
             return False
 
     def parse(self, path: Path) -> ParsedSpectrum:
-        raw_text = path.read_text(encoding="utf-8-sig")
+        raw_bytes, _raw_text = _read_raw_csv(path)
         record, rejection = parse_csv_file(path, require_labels=True)
         if rejection is not None or record is None:
             reason = rejection["details"] if rejection is not None else "unknown parse error"
@@ -83,7 +88,8 @@ class NIRCsvParser:
         return ParsedSpectrum(
             file_name=path.name,
             source_path=str(path.resolve()),
-            raw_csv_gzip=gzip.compress(raw_text.encode("utf-8")),
+            raw_csv_gzip=gzip.compress(raw_bytes),
+            content_sha256=hashlib.sha256(raw_bytes).hexdigest(),
             metadata=metadata,
             axis_kind="wavelength",
             axis_unit="nm",
@@ -105,8 +111,8 @@ class FourierCsvParser:
         return _detect_xy_tail_axis_kind(rows) == "wavenumber"
 
     def parse(self, path: Path) -> ParsedSpectrum:
-        raw_text = path.read_text(encoding="utf-8-sig")
-        rows = _read_csv_rows(path)
+        raw_bytes, raw_text = _read_raw_csv(path)
+        rows = _read_csv_rows_from_text(raw_text)
         x_values, y_values, labels, part_name = _parse_xy_tail_csv(rows, path)
         sample_id, acquisition_date, acquisition_time = _parse_fourier_filename_metadata(path)
         metadata = {
@@ -120,7 +126,8 @@ class FourierCsvParser:
         return ParsedSpectrum(
             file_name=path.name,
             source_path=str(path.resolve()),
-            raw_csv_gzip=gzip.compress(raw_text.encode("utf-8")),
+            raw_csv_gzip=gzip.compress(raw_bytes),
+            content_sha256=hashlib.sha256(raw_bytes).hexdigest(),
             metadata=metadata,
             axis_kind="wavenumber",
             axis_unit="cm^-1",
@@ -142,8 +149,8 @@ class GratingCsvParser:
         return _detect_xy_tail_axis_kind(rows) == "wavelength"
 
     def parse(self, path: Path) -> ParsedSpectrum:
-        raw_text = path.read_text(encoding="utf-8-sig")
-        rows = _read_csv_rows(path)
+        raw_bytes, raw_text = _read_raw_csv(path)
+        rows = _read_csv_rows_from_text(raw_text)
         x_values, y_values, labels, part_name = _parse_xy_tail_csv(rows, path)
         sample_id, acquisition_date, acquisition_time = _parse_grating_filename_metadata(path)
         metadata = {
@@ -157,7 +164,8 @@ class GratingCsvParser:
         return ParsedSpectrum(
             file_name=path.name,
             source_path=str(path.resolve()),
-            raw_csv_gzip=gzip.compress(raw_text.encode("utf-8")),
+            raw_csv_gzip=gzip.compress(raw_bytes),
+            content_sha256=hashlib.sha256(raw_bytes).hexdigest(),
             metadata=metadata,
             axis_kind="wavelength",
             axis_unit="nm",
@@ -182,6 +190,19 @@ class ParserRegistry:
 def _read_csv_rows(path: Path) -> list[list[str]]:
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         return list(csv.reader(handle))
+
+
+def _read_raw_csv(path: Path) -> tuple[bytes, str]:
+    raw_bytes = path.read_bytes()
+    try:
+        raw_text = raw_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{path.name}: CSV must be UTF-8 encoded") from error
+    return raw_bytes, raw_text
+
+
+def _read_csv_rows_from_text(raw_text: str) -> list[list[str]]:
+    return list(csv.reader(raw_text.splitlines()))
 
 
 def _detect_xy_tail_axis_kind(rows: list[list[str]]) -> str | None:
@@ -242,11 +263,18 @@ def _parse_xy_tail_csv(rows: list[list[str]], path: Path) -> tuple[list[float], 
             y_value = float(second)
         except ValueError:
             continue
+        if not math.isfinite(x_value) or not math.isfinite(y_value):
+            raise ValueError(f"{path.name}: XY data contains NaN or infinite values")
         x_values.append(x_value)
         y_values.append(y_value)
 
-    if not x_values:
+    if len(x_values) < 2:
         raise ValueError(f"{path.name}: no numeric XY data rows were found")
+    ordered_pairs = sorted(zip(x_values, y_values), key=lambda pair: pair[0])
+    if any(left[0] >= right[0] for left, right in zip(ordered_pairs, ordered_pairs[1:])):
+        raise ValueError(f"{path.name}: X axis contains duplicate or non-monotonic values")
+    x_values = [pair[0] for pair in ordered_pairs]
+    y_values = [pair[1] for pair in ordered_pairs]
     return x_values, y_values, labels, part_name
 
 
@@ -271,9 +299,23 @@ def _parse_tail_labels(row: list[str], path: Path) -> tuple[list[ParsedComponent
             value = float(tokens[index + 1])
         except ValueError as error:
             raise ValueError(f"{path.name}: invalid label value {tokens[index + 1]}") from error
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{path.name}: label values must be finite and positive")
         merged[normalized_name] += value
 
-    labels = [ParsedComponent(name=name, value=value) for name, value in merged.items()]
+    if len(merged) < 1 or len(merged) > 4:
+        raise ValueError(f"{path.name}: expected 1-4 components, got {len(merged)}")
+    total = sum(merged.values())
+    if abs(total - LABEL_SUM_TARGET) > LABEL_SUM_TOLERANCE:
+        raise ValueError(
+            f"{path.name}: label sum {total:.4f} is outside "
+            f"{LABEL_SUM_TARGET} +/- {LABEL_SUM_TOLERANCE}"
+        )
+    scale = LABEL_SUM_TARGET / total
+    labels = [
+        ParsedComponent(name=name, value=round(value * scale, 8))
+        for name, value in merged.items()
+    ]
     return labels, part_name
 
 

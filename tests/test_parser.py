@@ -88,6 +88,34 @@ class ParserTests(unittest.TestCase):
             assert record is not None
             self.assertEqual(record["parse_status"], "ok_unlabeled")
 
+    def test_rejects_non_finite_scan_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "ISC_Hadamard 1_棉,100.0_ABC123_20240101_120000_1.csv"
+            content = make_csv_text(labels=[("棉", 100.0)]).replace(",0.100000,", ",nan,", 1)
+            path.write_text(content, encoding="utf-8")
+            record, rejection = parse_csv_file(path, require_labels=True)
+            self.assertIsNone(record)
+            assert rejection is not None
+            self.assertEqual(rejection["reason"], "invalid_scan_data")
+
+    def test_rejects_scans_that_do_not_cover_the_model_grid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "ISC_Hadamard 1_棉,100.0_ABC123_20240101_120000_1.csv"
+            content = make_csv_text(labels=[("棉", 100.0)])
+            content = "\n".join(
+                (
+                    f"{float(line.split(',', 1)[0]) + 50:.6f},{line.split(',', 1)[1]}"
+                    if line and line[0].isdigit() and len(line.split(",", 1)) == 2
+                    else line
+                )
+                for line in content.splitlines()
+            )
+            path.write_text(content, encoding="utf-8")
+            record, rejection = parse_csv_file(path, require_labels=True)
+            self.assertIsNone(record)
+            assert rejection is not None
+            self.assertEqual(rejection["reason"], "insufficient_wavelength_coverage")
+
 
 if __name__ == "__main__":
     unittest.main()

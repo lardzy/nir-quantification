@@ -41,6 +41,7 @@ export type SpectrumItem = {
   id: number;
   file_name: string;
   source_path_last_seen: string;
+  content_sha256?: string | null;
   metadata: Record<string, unknown>;
   axis_kind: AxisKind | string;
   axis_unit: string;
