@@ -191,12 +191,23 @@ class JobManager:
         if spectra_exists and (not stats_exists or not axis_stats_exists) and running_job is None:
             self.create_class_stats_rebuild_job(reason="startup")
 
-    def create_import_job(self, root_path: Path, recursive: bool = True) -> dict[str, Any]:
+    def create_import_job(
+        self,
+        root_path: Path,
+        recursive: bool = True,
+        validate_labels: bool = True,
+    ) -> dict[str, Any]:
         with session_scope(self.session_factory) as session:
             job = Job(
                 type="import",
                 status="pending",
-                params_json=encode_json({"root_path": str(root_path), "recursive": recursive}),
+                params_json=encode_json(
+                    {
+                        "root_path": str(root_path),
+                        "recursive": recursive,
+                        "validate_labels": validate_labels,
+                    }
+                ),
                 stats_json=encode_json({}),
                 progress_message="Queued",
             )
@@ -397,6 +408,7 @@ class JobManager:
             params = decode_json(job.params_json, {})
             root_path = Path(params["root_path"])
             recursive = bool(params.get("recursive", True))
+            validate_labels = bool(params.get("validate_labels", True))
             job.status = "running"
             job.started_at = utcnow()
             job.progress_message = "Scanning files"
@@ -446,7 +458,14 @@ class JobManager:
                 chunk_size = max(self.settings.job_batch_size, self.settings.max_workers * 2)
                 for start in range(0, len(unique_paths), chunk_size):
                     chunk = unique_paths[start : start + chunk_size]
-                    future_map = {executor.submit(self.parser_registry.parse, path): path for path in chunk}
+                    future_map = {
+                        executor.submit(
+                            self.parser_registry.parse,
+                            path,
+                            validate_labels=validate_labels,
+                        ): path
+                        for path in chunk
+                    }
                     batch = []
                     for future in as_completed(future_map):
                         path = future_map.pop(future)

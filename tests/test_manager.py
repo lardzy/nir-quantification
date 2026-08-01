@@ -506,6 +506,46 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(completed["imported_count"], 0)
         self.assertEqual(completed["failed_count"], 1)
+        self.assertTrue(completed["params"]["validate_labels"])
+
+    def test_import_label_validation_can_be_disabled_for_all_formats(self) -> None:
+        labels = [("未知纤维", 30.0), ("棉", 50.0)]
+        portable_name = "ISC_Hadamard 1_未知纤维,30.0,棉,50.0_RELAX1_20240101_120000_1.csv"
+        fourier_name = "样品编号 RELAX2  2025-09-09 083855 GMT+0800.csv"
+        grating_name = "SupNIR-3100230122253A03_20240924163908.csv"
+        (self.import_root / portable_name).write_text(make_csv_text(labels), encoding="utf-8")
+        (self.import_root / fourier_name).write_text(make_fourier_csv_text(labels), encoding="utf-8")
+        (self.import_root / grating_name).write_text(make_grating_csv_text(labels), encoding="utf-8")
+
+        job = self.client.post(
+            "/api/import-jobs",
+            json={
+                "root_path": str(self.import_root),
+                "recursive": True,
+                "validate_labels": False,
+            },
+        ).json()
+        completed = self._wait_for_job(job["id"])
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["imported_count"], 3)
+        self.assertEqual(completed["failed_count"], 0)
+        self.assertFalse(completed["params"]["validate_labels"])
+
+        classes = self.client.get("/api/classes", params={"sort": "name"}).json()["items"]
+        self.assertEqual(len(classes), 1)
+        self.assertEqual(classes[0]["total_count"], 3)
+        spectra = self.client.get(
+            "/api/spectra",
+            params={"class_key": classes[0]["class_key"], "excluded": "active", "limit": 2000},
+        ).json()["items"]
+        self.assertEqual(len(spectra), 3)
+        for spectrum in spectra:
+            self.assertEqual(
+                {item["name"]: item["value"] for item in spectrum["labels"]},
+                {"未知纤维": 30.0, "棉": 50.0},
+            )
+            self.assertEqual(sum(item["value"] for item in spectrum["labels"]), 80.0)
 
     def test_mixed_axis_subsets_preserve_both_axis_types(self) -> None:
         labels = [("棉", 71.0), ("聚酯纤维", 29.0)]

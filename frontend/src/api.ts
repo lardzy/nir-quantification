@@ -20,10 +20,10 @@ export const api = {
     const query = path ? `?kind=${kind}&path=${encodeURIComponent(path)}` : `?kind=${kind}`;
     return request(`/api/fs/browse${query}`);
   },
-  async createImportJob(rootPath: string): Promise<JobItem> {
+  async createImportJob(rootPath: string, validateLabels = true): Promise<JobItem> {
     return request("/api/import-jobs", {
       method: "POST",
-      body: JSON.stringify({ root_path: rootPath, recursive: true })
+      body: JSON.stringify({ root_path: rootPath, recursive: true, validate_labels: validateLabels })
     });
   },
   async createExportJob(exportRoot: string, scope: "active" | "excluded" | "all", classKeys: string[]): Promise<JobItem> {

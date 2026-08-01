@@ -45,7 +45,7 @@ class ParsedSpectrum:
 class SpectrumParser(Protocol):
     def can_parse(self, path: Path) -> bool: ...
 
-    def parse(self, path: Path) -> ParsedSpectrum: ...
+    def parse(self, path: Path, validate_labels: bool = True) -> ParsedSpectrum: ...
 
 
 class NIRCsvParser:
@@ -59,18 +59,28 @@ class NIRCsvParser:
         except OSError:
             return False
 
-    def parse(self, path: Path) -> ParsedSpectrum:
+    def parse(self, path: Path, validate_labels: bool = True) -> ParsedSpectrum:
         raw_bytes, _raw_text = _read_raw_csv(path)
-        record, rejection = parse_csv_file(path, require_labels=True)
+        record, rejection = parse_csv_file(
+            path,
+            require_labels=True,
+            validate_labels=validate_labels,
+        )
         if rejection is not None or record is None:
             reason = rejection["details"] if rejection is not None else "unknown parse error"
             raise ValueError(reason)
 
-        labels = [
-            ParsedComponent(name=FIBER_CLASSES[index], value=value)
-            for index, value in enumerate(record["composition_14"])
-            if value > 0
-        ]
+        if validate_labels:
+            labels = [
+                ParsedComponent(name=FIBER_CLASSES[index], value=value)
+                for index, value in enumerate(record["composition_14"])
+                if value > 0
+            ]
+        else:
+            labels = [
+                ParsedComponent(name=component["name"], value=component["value"])
+                for component in record["label_components"]
+            ]
         metadata = {
             "fabric_id": record["fabric_id"],
             "date": record["date"],
@@ -110,10 +120,14 @@ class FourierCsvParser:
             return False
         return _detect_xy_tail_axis_kind(rows) == "wavenumber"
 
-    def parse(self, path: Path) -> ParsedSpectrum:
+    def parse(self, path: Path, validate_labels: bool = True) -> ParsedSpectrum:
         raw_bytes, raw_text = _read_raw_csv(path)
         rows = _read_csv_rows_from_text(raw_text)
-        x_values, y_values, labels, part_name = _parse_xy_tail_csv(rows, path)
+        x_values, y_values, labels, part_name = _parse_xy_tail_csv(
+            rows,
+            path,
+            validate_labels=validate_labels,
+        )
         sample_id, acquisition_date, acquisition_time = _parse_fourier_filename_metadata(path)
         metadata = {
             "sample_id": sample_id,
@@ -148,10 +162,14 @@ class GratingCsvParser:
             return False
         return _detect_xy_tail_axis_kind(rows) == "wavelength"
 
-    def parse(self, path: Path) -> ParsedSpectrum:
+    def parse(self, path: Path, validate_labels: bool = True) -> ParsedSpectrum:
         raw_bytes, raw_text = _read_raw_csv(path)
         rows = _read_csv_rows_from_text(raw_text)
-        x_values, y_values, labels, part_name = _parse_xy_tail_csv(rows, path)
+        x_values, y_values, labels, part_name = _parse_xy_tail_csv(
+            rows,
+            path,
+            validate_labels=validate_labels,
+        )
         sample_id, acquisition_date, acquisition_time = _parse_grating_filename_metadata(path)
         metadata = {
             "sample_id": sample_id,
@@ -180,10 +198,10 @@ class ParserRegistry:
     def __init__(self, parsers: list[SpectrumParser] | None = None) -> None:
         self.parsers = parsers or [NIRCsvParser(), FourierCsvParser(), GratingCsvParser()]
 
-    def parse(self, path: Path) -> ParsedSpectrum:
+    def parse(self, path: Path, validate_labels: bool = True) -> ParsedSpectrum:
         for parser in self.parsers:
             if parser.can_parse(path):
-                return parser.parse(path)
+                return parser.parse(path, validate_labels=validate_labels)
         raise ValueError(f"no parser found for {path.name}")
 
 
@@ -237,7 +255,11 @@ def _extract_numeric_x_values(rows: list[list[str]]) -> list[float]:
     return x_values
 
 
-def _parse_xy_tail_csv(rows: list[list[str]], path: Path) -> tuple[list[float], list[float], list[ParsedComponent], str | None]:
+def _parse_xy_tail_csv(
+    rows: list[list[str]],
+    path: Path,
+    validate_labels: bool = True,
+) -> tuple[list[float], list[float], list[ParsedComponent], str | None]:
     last_non_empty_index = None
     for index in range(len(rows) - 1, -1, -1):
         if any(cell.strip() for cell in rows[index]):
@@ -247,7 +269,7 @@ def _parse_xy_tail_csv(rows: list[list[str]], path: Path) -> tuple[list[float], 
         raise ValueError("file does not contain any non-empty rows")
 
     label_row = rows[last_non_empty_index]
-    labels, part_name = _parse_tail_labels(label_row, path)
+    labels, part_name = _parse_tail_labels(label_row, path, validate_labels=validate_labels)
 
     x_values: list[float] = []
     y_values: list[float] = []
@@ -278,7 +300,11 @@ def _parse_xy_tail_csv(rows: list[list[str]], path: Path) -> tuple[list[float], 
     return x_values, y_values, labels, part_name
 
 
-def _parse_tail_labels(row: list[str], path: Path) -> tuple[list[ParsedComponent], str | None]:
+def _parse_tail_labels(
+    row: list[str],
+    path: Path,
+    validate_labels: bool = True,
+) -> tuple[list[ParsedComponent], str | None]:
     if len(row) < 3:
         raise ValueError(f"{path.name}: footer label row is incomplete")
 
@@ -293,7 +319,7 @@ def _parse_tail_labels(row: list[str], path: Path) -> tuple[list[ParsedComponent
     for index in range(0, len(tokens), 2):
         raw_name = tokens[index]
         normalized_name = normalize_fiber_name(raw_name)
-        if normalized_name is None:
+        if normalized_name is None and validate_labels:
             raise ValueError(f"{path.name}: unknown fiber label {raw_name}")
         try:
             value = float(tokens[index + 1])
@@ -301,17 +327,17 @@ def _parse_tail_labels(row: list[str], path: Path) -> tuple[list[ParsedComponent
             raise ValueError(f"{path.name}: invalid label value {tokens[index + 1]}") from error
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"{path.name}: label values must be finite and positive")
-        merged[normalized_name] += value
+        merged[normalized_name or raw_name.strip()] += value
 
     if len(merged) < 1 or len(merged) > 4:
         raise ValueError(f"{path.name}: expected 1-4 components, got {len(merged)}")
     total = sum(merged.values())
-    if abs(total - LABEL_SUM_TARGET) > LABEL_SUM_TOLERANCE:
+    if validate_labels and abs(total - LABEL_SUM_TARGET) > LABEL_SUM_TOLERANCE:
         raise ValueError(
             f"{path.name}: label sum {total:.4f} is outside "
             f"{LABEL_SUM_TARGET} +/- {LABEL_SUM_TOLERANCE}"
         )
-    scale = LABEL_SUM_TARGET / total
+    scale = LABEL_SUM_TARGET / total if validate_labels else 1.0
     labels = [
         ParsedComponent(name=name, value=round(value * scale, 8))
         for name, value in merged.items()

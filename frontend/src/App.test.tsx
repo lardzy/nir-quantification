@@ -563,6 +563,21 @@ describe("App", () => {
     );
   });
 
+  it("passes the import label-validation switch to the new job", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    const validationSwitch = await screen.findByRole("switch", { name: "校验纤维名称和含量总和" });
+    expect(validationSwitch).toBeChecked();
+    await user.click(validationSwitch);
+
+    const importButton = await screen.findByRole("button", { name: /开始导入/ });
+    await waitFor(() => expect(importButton).toBeEnabled());
+    await user.click(importButton);
+
+    await waitFor(() => expect(api.createImportJob).toHaveBeenCalledWith("/workspace/imports", false));
+  });
+
   it("creates subsets with the updated count and ratio semantics", async () => {
     const user = userEvent.setup();
     render(<App />);

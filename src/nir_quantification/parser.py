@@ -20,7 +20,11 @@ from .constants import (
 WAVELENGTH_COVERAGE_TOLERANCE = 1.0
 
 
-def parse_csv_file(path: str | Path, require_labels: bool = True) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+def parse_csv_file(
+    path: str | Path,
+    require_labels: bool = True,
+    validate_labels: bool = True,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     csv_path = Path(path)
     try:
         rows = list(_read_csv_rows(csv_path))
@@ -50,7 +54,11 @@ def parse_csv_file(path: str | Path, require_labels: bool = True) -> tuple[dict[
             return None, _reject(csv_path, "missing_footer_labels", "footer labels are required for manifest building")
 
         if footer_labels:
-            composition_vector, footer_label_map = _build_composition_vector(footer_labels, csv_path)
+            composition_vector, footer_label_map = _build_composition_vector(
+                footer_labels,
+                csv_path,
+                validate_labels=validate_labels,
+            )
         else:
             composition_vector = [0.0] * len(FIBER_CLASSES)
             footer_label_map = {}
@@ -64,7 +72,21 @@ def parse_csv_file(path: str | Path, require_labels: bool = True) -> tuple[dict[
         fixed_absorbance = _linear_interpolate(wavelengths, absorbance, FIXED_WAVELENGTHS)
         present_vector = [1 if value > 0.0 else 0 for value in composition_vector]
         non_zero_indices = [index for index, value in enumerate(composition_vector) if value > 0.0]
-        dominant_index = max(range(len(composition_vector)), key=lambda index: composition_vector[index]) if non_zero_indices else None
+        if validate_labels:
+            num_components = len(non_zero_indices)
+            dominant_index = (
+                max(range(len(composition_vector)), key=lambda index: composition_vector[index])
+                if non_zero_indices
+                else None
+            )
+            dominant_fiber = FIBER_CLASSES[dominant_index] if dominant_index is not None else None
+        else:
+            num_components = len(footer_label_map)
+            dominant_fiber = (
+                max(footer_label_map, key=lambda name: footer_label_map[name])
+                if footer_label_map
+                else None
+            )
 
         record = {
             "file_path": str(csv_path.resolve()),
@@ -82,12 +104,17 @@ def parse_csv_file(path: str | Path, require_labels: bool = True) -> tuple[dict[
             "fixed_absorbance": fixed_absorbance,
             "composition_14": composition_vector,
             "present_14": present_vector,
-            "num_components": len(non_zero_indices),
-            "dominant_fiber": FIBER_CLASSES[dominant_index] if dominant_index is not None else None,
+            "num_components": num_components,
+            "dominant_fiber": dominant_fiber,
             "label_source": "footer" if footer_label_map else "none",
             "parse_status": "ok_with_warning" if warnings else ("ok" if footer_label_map else "ok_unlabeled"),
             "warnings": warnings,
         }
+        if not validate_labels:
+            record["label_components"] = [
+                {"name": name, "value": value}
+                for name, value in footer_label_map.items()
+            ]
         return record, None
     except ParseError as error:
         return None, _reject(csv_path, error.reason, error.details)
@@ -217,29 +244,34 @@ def _parse_footer_labels(footer_rows: list[list[str]], csv_path: Path, require_l
     return labels
 
 
-def _build_composition_vector(labels: list[tuple[str, float]], csv_path: Path) -> tuple[list[float], dict[str, float]]:
+def _build_composition_vector(
+    labels: list[tuple[str, float]],
+    csv_path: Path,
+    validate_labels: bool = True,
+) -> tuple[list[float], dict[str, float]]:
     merged = Counter()
     for raw_name, value in labels:
         if not math.isfinite(value) or value <= 0:
             raise ParseError("invalid_label_value", f"label values must be finite and positive: {raw_name}={value}")
         normalized_name = normalize_fiber_name(raw_name)
-        if normalized_name is None:
+        if normalized_name is None and validate_labels:
             raise ParseError("unknown_fiber_label", f"unknown fiber label: {raw_name}")
-        merged[normalized_name] += value
+        merged[normalized_name or raw_name.strip()] += value
 
     num_components = len(merged)
     if num_components < 1 or num_components > 4:
         raise ParseError("invalid_label_count", f"expected 1-4 components, got {num_components}")
 
     total = sum(merged.values())
-    if math.fabs(total - LABEL_SUM_TARGET) > LABEL_SUM_TOLERANCE:
+    if validate_labels and math.fabs(total - LABEL_SUM_TARGET) > LABEL_SUM_TOLERANCE:
         raise ParseError("invalid_label_sum", f"label sum {total:.4f} is outside {LABEL_SUM_TARGET} +/- {LABEL_SUM_TOLERANCE}")
 
-    scale = LABEL_SUM_TARGET / total if total else 1.0
+    scale = LABEL_SUM_TARGET / total if validate_labels and total else 1.0
     normalized_map = {name: round(value * scale, 8) for name, value in merged.items()}
     vector = [0.0] * len(FIBER_CLASSES)
     for name, value in normalized_map.items():
-        vector[FIBER_TO_INDEX[name]] = value
+        if name in FIBER_TO_INDEX:
+            vector[FIBER_TO_INDEX[name]] = value
     return vector, normalized_map
 
 

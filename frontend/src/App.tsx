@@ -59,6 +59,7 @@ type PathChooserProps = {
   actionIcon: ReactNode;
   actionDisabled?: boolean;
   onAction: () => Promise<void>;
+  children?: ReactNode;
 };
 
 type ExportScope = "active" | "excluded" | "all";
@@ -154,7 +155,8 @@ function PathChooserCard({
   actionLabel,
   actionIcon,
   actionDisabled = false,
-  onAction
+  onAction,
+  children
 }: PathChooserProps) {
   const [roots, setRoots] = useState<string[]>([]);
   const [entries, setEntries] = useState<FsEntry[]>([]);
@@ -226,6 +228,7 @@ function PathChooserCard({
             {currentPath ?? "未选择目录"}
           </Paragraph>
         </div>
+        {children}
         {browseError && <Alert type="error" showIcon message="目录读取失败" description={browseError} />}
         <div className="path-actions">
           {parentPath && (
@@ -366,6 +369,7 @@ function Workspace() {
   const [jobs, setJobs] = useState<JobItem[]>([]);
   const [recentExcluded, setRecentExcluded] = useState<SpectrumItem[]>([]);
   const [importPath, setImportPath] = useState<string | null>(null);
+  const [validateImportLabels, setValidateImportLabels] = useState(true);
   const [exportPath, setExportPath] = useState<string | null>(null);
   const [subsetMode, setSubsetMode] = useState<"count" | "ratio">("count");
   const [subsetInput, setSubsetInput] = useState<string>("4");
@@ -753,7 +757,7 @@ function Workspace() {
         messageApi.warning("请先选择导入目录");
         return;
       }
-      const job = await api.createImportJob(importPath);
+      const job = await api.createImportJob(importPath, validateImportLabels);
       trackJob(job);
       messageApi.success("导入任务已创建");
     } catch (error) {
@@ -1272,7 +1276,23 @@ function Workspace() {
                   actionLabel="开始导入"
                   actionIcon={<CloudUploadOutlined />}
                   onAction={startImport}
-                />
+                >
+                  <div className="switch-row">
+                    <div>
+                      <Text>校验纤维名称和含量总和</Text>
+                      <div>
+                        <Text type="secondary">
+                          关闭后允许未知名称和非 100% 合计，仍校验 CSV 结构与数值格式
+                        </Text>
+                      </div>
+                    </div>
+                    <Switch
+                      aria-label="校验纤维名称和含量总和"
+                      checked={validateImportLabels}
+                      onChange={setValidateImportLabels}
+                    />
+                  </div>
+                </PathChooserCard>
 
                 <Card title="分类总览" extra={<Badge count={filteredClasses.length} color="#155eef" />} className="scroll-card">
                   <Space direction="vertical" size="middle" style={{ width: "100%" }}>

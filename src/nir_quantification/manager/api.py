@@ -30,6 +30,7 @@ from .service import (
 class ImportJobRequest(BaseModel):
     root_path: str
     recursive: bool = True
+    validate_labels: bool = True
 
 
 class ExportJobRequest(BaseModel):
@@ -100,7 +101,11 @@ def create_router(settings: ManagerSettings, session_factory: sessionmaker, job_
         root_path = _resolve_allowed_path(payload.root_path, settings.import_roots)
         if root_path is None or not root_path.exists():
             raise HTTPException(status_code=400, detail="import root is not accessible")
-        return job_manager.create_import_job(root_path=root_path, recursive=payload.recursive)
+        return job_manager.create_import_job(
+            root_path=root_path,
+            recursive=payload.recursive,
+            validate_labels=payload.validate_labels,
+        )
 
     @router.post("/export-jobs")
     def create_export_job(payload: ExportJobRequest) -> dict:

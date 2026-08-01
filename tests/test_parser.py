@@ -70,6 +70,28 @@ class ParserTests(unittest.TestCase):
             assert rejection is not None
             self.assertEqual(rejection["reason"], "invalid_label_sum")
 
+    def test_allows_unknown_fiber_and_non_100_sum_when_label_validation_is_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "ISC_Hadamard 1_未知纤维,40.0,棉,50.0_ABC123_20240101_120000_1.csv"
+            path.write_text(make_csv_text(labels=[("未知纤维", 40.0), ("棉", 50.0)]), encoding="utf-8")
+
+            record, rejection = parse_csv_file(
+                path,
+                require_labels=True,
+                validate_labels=False,
+            )
+
+            self.assertIsNone(rejection)
+            assert record is not None
+            self.assertEqual(
+                record["label_components"],
+                [
+                    {"name": "未知纤维", "value": 40.0},
+                    {"name": "棉", "value": 50.0},
+                ],
+            )
+            self.assertEqual(sum(item["value"] for item in record["label_components"]), 90.0)
+
     def test_rejects_missing_end_marker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "ISC_Hadamard 1_聚酯纤维,100.0_ABC123_20240101_120000_1.csv"
