@@ -3,26 +3,12 @@ services:
     build: .
     ports:
       - "127.0.0.1:8000:8000"
-    read_only: true
-    tmpfs:
-      - /tmp
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - DAC_OVERRIDE
-      - SETGID
-      - SETUID
     environment:
       NIRQ_DB_PATH: /data/spectra.sqlite3
       IMPORT_ROOTS: /workspace/imports
       EXPORT_ROOTS: /workspace/exports
       NIRQ_STATIC_DIR: /app/frontend/dist
-      NIRQ_RUN_UID: "${NIRQ_RUN_UID:-10001}"
-      NIRQ_RUN_GID: "${NIRQ_RUN_GID:-10001}"
     volumes:
       - ./data:/data
       - ./exports:/workspace/exports
-      - ./.temp:/workspace/imports:ro
+      - ./.temp:/workspace/imports

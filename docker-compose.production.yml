@@ -2,36 +2,35 @@ services:
   nirq-web:
     build: .
     ports:
-      - "${NIRQ_BIND_ADDRESS:-0.0.0.0}:${NIRQ_PORT:-8001}:8000"
+      - "8001:8000"
     restart: unless-stopped
-    read_only: true
-    tmpfs:
-      - /tmp
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - DAC_OVERRIDE
-      - SETGID
-      - SETUID
     environment:
       NIRQ_DB_PATH: /data/spectra.sqlite3
       IMPORT_ROOTS: /workspace/imports
       EXPORT_ROOTS: /workspace/exports
       NIRQ_STATIC_DIR: /app/frontend/dist
-      NIRQ_RUN_UID: "${NIRQ_RUN_UID:-10001}"
-      NIRQ_RUN_GID: "${NIRQ_RUN_GID:-10001}"
     volumes:
       - ./data:/data
       - ./exports:/workspace/exports
-      - area_import_cifs:/workspace/imports:ro
+      - area_import_cifs:/workspace/imports
 
 volumes:
+  postgres_data:
+
+  area_import_OLD_cifs:
+    driver: local
+    driver_opts:
+      type: cifs
+      o: "username=${SMB_USER_A},password=${SMB_PASS_A},vers=3.0,iocharset=utf8,noperm,uid=0,gid=0,file_mode=0777,dir_mode=0777"
+      device: "//192.168.105.66/17检验八部/11公共/近红外光谱采集"
+
   area_import_cifs:
     driver: local
     driver_opts:
       type: cifs
       o: "username=${SMB_USER_B},password=${SMB_PASS_B},vers=3.0,iocharset=utf8,noperm,uid=0,gid=0,file_mode=0777,dir_mode=0777"
       device: "//192.168.105.82/材料检测中心/11公共/近红外光谱采集"
+
+networks:
+  textile-net:
+    driver: bridge

@@ -90,8 +90,6 @@ docker compose up -d --build
 docker compose -f docker-compose.production.yml up -d --build
 ```
 
-容器入口会先把 `/data` 和导出目录修正为运行 UID/GID（默认 `10001:10001`），然后立即降权启动服务。这样可以兼容历史上由 root 容器创建的 SQLite、WAL 和导出目录；升级前仍建议备份 `data/`。如部署环境需要指定其他 UID/GID，可设置 `NIRQ_RUN_UID` 和 `NIRQ_RUN_GID`。
-
 如果确认旧数据库没有需要保留的数据，可以直接停止服务并删除 SQLite 文件后重建：
 
 ```bash
