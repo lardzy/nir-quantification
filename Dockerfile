@@ -12,14 +12,16 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV NIRQ_STATIC_DIR=/app/frontend/dist
 ENV PATH="/app/.venv/bin:$PATH"
+ENV HOME=/tmp
 COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 RUN uv sync --frozen --no-dev --extra web \
     && mkdir -p /data /workspace/imports /workspace/exports \
-    && chown -R 10001:10001 /data /workspace
-USER 10001:10001
+    && chmod 0755 /usr/local/bin/docker-entrypoint.sh
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).read()"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["nirq", "web", "--host", "0.0.0.0", "--port", "8000"]

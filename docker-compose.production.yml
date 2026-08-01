@@ -2,7 +2,8 @@ services:
   nirq-web:
     build: .
     ports:
-      - "127.0.0.1:8000:8000"
+      - "${NIRQ_BIND_ADDRESS:-0.0.0.0}:${NIRQ_PORT:-8001}:8000"
+    restart: unless-stopped
     read_only: true
     tmpfs:
       - /tmp
@@ -25,4 +26,12 @@ services:
     volumes:
       - ./data:/data
       - ./exports:/workspace/exports
-      - ./.temp:/workspace/imports:ro
+      - area_import_cifs:/workspace/imports:ro
+
+volumes:
+  area_import_cifs:
+    driver: local
+    driver_opts:
+      type: cifs
+      o: "username=${SMB_USER_B},password=${SMB_PASS_B},vers=3.0,iocharset=utf8,noperm,uid=0,gid=0,file_mode=0777,dir_mode=0777"
+      device: "//192.168.105.82/材料检测中心/11公共/近红外光谱采集"
